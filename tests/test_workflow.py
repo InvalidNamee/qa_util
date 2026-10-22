@@ -4,8 +4,8 @@ from dataclasses import replace
 
 import pytest
 
-from comment_util.control import Control
-from comment_util.workflow import Workflow
+from qa_util.control import Control
+from qa_util.workflow import Workflow
 from conftest import FakeGenerator, FakePool
 
 
@@ -13,9 +13,10 @@ async def accept(_):
     return True
 
 
-def make_workflow(config, tmp_path, pool, *, confirm=accept, generator=None, control=None):
+def make_workflow(config, tmp_path, pool, *, confirm=accept, generator=None, control=None, progress=None):
     return Workflow(config, confirm, lambda _: None, output_root=tmp_path,
-                    browser_factory=lambda *_: pool, generator=generator or FakeGenerator(), control=control)
+                    browser_factory=lambda *_: pool, generator=generator or FakeGenerator(), control=control,
+                    progress=progress)
 
 
 async def test_six_accounts_two_workers_all_targets_and_existing_answers(config, tmp_path):
@@ -23,7 +24,8 @@ async def test_six_accounts_two_workers_all_targets_and_existing_answers(config,
     for user, count in zip("abcdef", (0, 1, 2, 3, 0, 2)):
         pool.seed(user, count)
     pool.no_button.add(("a", "https://fixture/c/0"))
-    workflow = make_workflow(config, tmp_path, pool)
+    events = []
+    workflow = make_workflow(config, tmp_path, pool, progress=events.append)
     result = await asyncio.wait_for(workflow.run(), timeout=3)
     assert result.status == "complete"
     assert pool.maximum == 2
@@ -44,6 +46,13 @@ async def test_six_accounts_two_workers_all_targets_and_existing_answers(config,
         assert q["owner"] != user
         assert q["answers"][user] == answer
     assert all("/d/2" not in q["url"] for q in final)
+    for user in "abcdef":
+        answers = [event for event in events if event.username == user and event.phase == "互答"]
+        assert answers[-1].current == 10 and answers[-1].total == 10 and answers[-1].state == "complete"
+        assert sorted({event.current for event in answers}) == list(range(11))
+    assert any(event.phase == "等待预览确认" for event in events)
+    assert any(event.username == "d" and event.phase == "补齐提问并冻结题池"
+               and event.current == event.total == 2 for event in events)
 
 
 async def test_declining_preview_has_no_publications(config, tmp_path):
@@ -60,6 +69,7 @@ async def test_declining_preview_has_no_publications(config, tmp_path):
     assert not pool.posts and not pool.answers
     assert (workflow.directory / "preview.txt").exists()
     assert not (workflow.directory / "questions.json").exists()
+    assert all(row.state == "cancelled" for row in workflow.progress.values())
 
 
 @pytest.mark.parametrize("phase", ["preflight", "question"])
@@ -85,6 +95,8 @@ async def test_answer_failure_does_not_stop_other_accounts(config, tmp_path):
     assert "回答目标：a0q0 https://fixture/a/new0" in debug
     assert "Traceback" in debug and "conftest.py" in debug and "RuntimeError: 回答失败" in debug
     assert "Traceback" not in (workflow.directory / "run.log").read_text()
+    assert workflow.progress["b"].state == "failed"
+    assert all(row.state == "complete" for user, row in workflow.progress.items() if user != "b")
 
 
 async def test_invalid_generated_data_cannot_reach_confirmation(config, tmp_path):

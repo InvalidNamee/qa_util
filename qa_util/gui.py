@@ -1,7 +1,10 @@
 import argparse
 import asyncio
 import json
+import os
 import queue
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -22,7 +25,9 @@ class App:
         self.preview_window = None
         self.decision = None
         self.closing = False
-        root.title("智慧树问答工具")
+        self.directory = None
+        self.progress_rows = {}
+        root.title("qa_util · 问答工具")
         root.geometry("900x720")
         root.minsize(660, 480)
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -46,23 +51,79 @@ class App:
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(actions, text="停止", command=self.request_stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
-        self.logs = ScrolledText(container, wrap="word", state="disabled")
-        self.logs.pack(fill="both", expand=True)
+        self.log_button = ttk.Button(actions, text="打开日志", command=self.open_log, state="disabled")
+        self.log_button.pack(side="right")
+        self.status = tk.StringVar(value="等待开始")
+        ttk.Label(container, textvariable=self.status).pack(anchor="w", pady=(0, 8))
+        progress_area = ttk.Frame(container)
+        progress_area.pack(fill="both", expand=True)
+        canvas = tk.Canvas(progress_area, highlightthickness=0)
+        scroll = ttk.Scrollbar(progress_area, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self.progress_frame = ttk.Frame(canvas)
+        window = canvas.create_window(0, 0, window=self.progress_frame, anchor="nw")
+        self.progress_frame.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
         self.load()
         self.root.after(100, self.poll)
 
     @staticmethod
-    def set_text(widget, text, *, append=False):
+    def set_text(widget, text):
         widget.configure(state="normal")
-        if not append:
-            widget.delete("1.0", "end")
+        widget.delete("1.0", "end")
         widget.insert("end", text)
         widget.configure(state="disabled")
-        if append:
-            widget.see("end")
 
-    def log(self, text):
-        self.set_text(self.logs, text + "\n", append=True)
+    def reset_progress(self):
+        for row in self.progress_rows.values():
+            row["bar"].stop()
+        for child in self.progress_frame.winfo_children():
+            child.destroy()
+        self.progress_rows = {}
+        for account in self.config.accounts:
+            row = ttk.Frame(self.progress_frame, padding=(0, 6, 12, 6))
+            row.pack(fill="x")
+            ttk.Label(row, text=account.username).pack(anchor="w")
+            label = tk.StringVar(value="等待开始")
+            ttk.Label(row, textvariable=label).pack(anchor="w", pady=3)
+            bar = ttk.Progressbar(row, mode="determinate", maximum=1, value=0)
+            bar.pack(fill="x")
+            self.progress_rows[account.username] = {"bar": bar, "label": label, "busy": False}
+
+    def update_progress(self, progress):
+        row = self.progress_rows.get(progress.username)
+        if row is None:
+            return
+        busy = progress.state == "running" and progress.total == 0 and not progress.detail
+        bar = row["bar"]
+        if row["busy"] != busy:
+            bar.stop()
+            bar.configure(mode="indeterminate" if busy else "determinate")
+            if busy:
+                bar.start(25)
+            row["busy"] = busy
+        if not busy:
+            bar.configure(maximum=max(1, progress.total), value=progress.current)
+            if progress.state == "complete" and not progress.total:
+                bar.configure(value=1)
+        count = f" {progress.current}/{progress.total}" if progress.total else ""
+        detail = f" · {progress.detail}" if progress.detail else ""
+        row["label"].set(progress.phase + count + detail)
+
+    def open_log(self):
+        path = self.directory / "debug.log" if self.directory else None
+        if not path or not path.exists():
+            self.status.set("日志尚未生成")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path))
+            else:
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
+        except OSError:
+            self.status.set(f"请手动打开日志：{path}")
 
     def select(self):
         path = filedialog.askopenfilename(
@@ -84,6 +145,7 @@ class App:
             self.start_button.configure(state="disabled")
             return False
         self.set_text(self.config_view, json.dumps(self.config.public_dict(), ensure_ascii=False, indent=2))
+        self.reset_progress()
         self.start_button.configure(state="normal")
         return True
 
@@ -92,9 +154,14 @@ class App:
             return
         config = self.config
         self.stop = threading.Event()
+        self.directory = None
+        self.log_button.configure(state="disabled")
+        self.status.set("运行中")
         self.set_running(True)
 
         def run():
+            workflow = None
+
             async def confirm(text):
                 decision = threading.Event()
                 answer = [False]
@@ -104,8 +171,10 @@ class App:
                 return answer[0]
 
             async def execute():
-                workflow = Workflow(config, confirm, lambda line: self.messages.put(("log", line)),
-                                    control=Control(self.stop))
+                nonlocal workflow
+                workflow = Workflow(config, confirm, lambda _: None, control=Control(self.stop),
+                                    progress=lambda event: self.messages.put(("progress", event)))
+                self.messages.put(("directory", workflow.directory))
                 result = await workflow.run()
                 return result, workflow.directory
 
@@ -113,8 +182,9 @@ class App:
                 result, directory = asyncio.run(execute())
                 self.messages.put(("done", (result.status, str(directory))))
             except Exception as error:
-                self.messages.put(("log", config.redact(f"运行失败：{error}")))
-                self.messages.put(("done", ("failed", "")))
+                if workflow and workflow.directory.exists():
+                    workflow.record_error("后台运行失败", error)
+                self.messages.put(("done", ("failed", str(workflow.directory) if workflow else "")))
 
         self.worker = threading.Thread(target=run, name="forum-worker", daemon=False)
         self.worker.start()
@@ -160,7 +230,7 @@ class App:
         self.stop.set()
         self.finish_preview(False)
         self.stop_button.configure(state="disabled")
-        self.log("正在停止并释放浏览器资源…")
+        self.status.set("正在停止并释放浏览器资源…")
 
     def close(self):
         self.closing = True
@@ -175,8 +245,11 @@ class App:
                 kind, payload = self.messages.get_nowait()
             except queue.Empty:
                 break
-            if kind == "log":
-                self.log(payload)
+            if kind == "progress":
+                self.update_progress(payload)
+            elif kind == "directory":
+                self.directory = Path(payload)
+                self.log_button.configure(state="normal")
             elif kind == "preview":
                 self.show_preview(payload)
             elif kind == "done":
@@ -184,7 +257,15 @@ class App:
                 status, directory = payload
                 labels = {"complete": "全部完成", "partial": "部分账号失败", "failed": "失败",
                           "stopped": "已停止", "cancelled": "已放弃"}
-                self.log(f"任务结果：{labels.get(status, status)}" + (f"，产物：{directory}" if directory else ""))
+                self.status.set(f"任务结果：{labels.get(status, status)}")
+                if directory:
+                    self.directory = Path(directory)
+                    self.log_button.configure(state="normal")
+                for row in self.progress_rows.values():
+                    if row["busy"]:
+                        row["bar"].stop()
+                        row["busy"] = False
+                        row["bar"].configure(mode="determinate", value=0)
                 self.set_running(False)
         if self.closing and (not self.worker or not self.worker.is_alive()):
             self.root.destroy()
@@ -193,7 +274,7 @@ class App:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="智慧树问答工具")
+    parser = argparse.ArgumentParser(prog="qa_util", description="智慧树问答工具")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="JSON配置路径")
     args = parser.parse_args()
     root = tk.Tk()

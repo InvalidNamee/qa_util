@@ -2,14 +2,14 @@ import json
 
 import pytest
 
-from comment_util.config import PROJECT_ROOT, load_config
+from qa_util.config import PROJECT_ROOT, load_config
 
 
 def test_example_loads_and_redacts():
     config = load_config(PROJECT_ROOT / "config.example.json")
     public = config.public_dict()
     assert public["accounts"][0]["password"] == "***"
-    assert public["llm"]["api_key"] == "***"
+    assert "llm" not in public
     assert "填写密码" not in repr(config)
     assert config.publish_interval_seconds == 10
 
@@ -47,3 +47,24 @@ def test_old_config_uses_default_publish_interval(tmp_path):
     raw["publish_interval_seconds"] = 15.5
     path.write_text(json.dumps(raw))
     assert load_config(path).publish_interval_seconds == 15.5
+
+
+def test_llm_is_loaded_from_dotenv_and_reload_reads_edits(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text('LLM_BASE_URL=https://llm.example.test/v1/\nLLM_MODEL=model-one\nLLM_API_KEY="env-key"\n')
+    config = load_config(PROJECT_ROOT / "config.example.json")
+    assert config.llm.base_url == "https://llm.example.test/v1"
+    assert config.llm.model == "model-one" and config.llm.api_key == "env-key"
+    env.write_text('LLM_BASE_URL=https://other.example.test/v1\nLLM_MODEL=model-two\nLLM_API_KEY=changed-key\n')
+    assert load_config(PROJECT_ROOT / "config.example.json").llm.model == "model-two"
+
+
+@pytest.mark.parametrize("missing", ["LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"])
+def test_missing_llm_env_is_reported_without_using_json_credentials(tmp_path, monkeypatch, missing):
+    raw = json.loads((PROJECT_ROOT / "config.example.json").read_text())
+    raw["llm"] = {"base_url": "https://old.example.test", "model": "old", "api_key": "old-key"}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw))
+    monkeypatch.delenv(missing)
+    with pytest.raises(ValueError, match=missing):
+        load_config(path)

@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from .config import PROJECT_ROOT
 from .control import Control
 from .generator import Generator
-from .models import AccountResult, Config, Question, RunResult, Stopped, normalize
+from .models import AccountProgress, AccountResult, Config, Question, RunResult, Stopped, normalize
 
 
 def preview_text(questions: list[Question]) -> str:
@@ -26,7 +26,7 @@ def preview_text(questions: list[Question]) -> str:
 
 class Workflow:
     def __init__(self, config: Config, confirm, log, *, control=None, output_root=None,
-                 browser_factory=None, generator=None):
+                 browser_factory=None, generator=None, progress=None):
         self.config, self.confirm, self.emit = config, confirm, log
         self.control = control or Control()
         stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d-%H%M%S-%f")
@@ -35,6 +35,21 @@ class Workflow:
         self.generator = generator or Generator(config, self.control, self.log)
         self.results = {a.username: AccountResult(a.username) for a in config.accounts}
         self.phase = "初始化"
+        self.emit_progress = progress or (lambda _: None)
+        self.progress = {a.username: AccountProgress(a.username) for a in config.accounts}
+        self.question_counts = {}
+        self.control.on_status = lambda username, detail: self.update_progress(username, detail=detail)
+
+    def update_progress(self, username, **changes):
+        changes = {k: self.config.redact(v) if isinstance(v, str) else v for k, v in changes.items()}
+        updated = replace(self.progress[username], **changes)
+        if updated != self.progress[username]:
+            self.progress[username] = updated
+            self.emit_progress(updated)
+
+    def all_progress(self, **changes):
+        for username in self.progress:
+            self.update_progress(username, **changes)
 
     def log(self, message: str):
         message = self.config.redact(message)
@@ -72,6 +87,13 @@ class Workflow:
             self.log(f"任务失败：{error}")
             result = RunResult("failed", list(self.results.values()))
         self.save("result.json", asdict(result))
+        for row in self.progress.values():
+            if row.state in {"complete", "failed"}:
+                continue
+            state = "cancelled" if result.status == "cancelled" else "stopped" if result.status == "stopped" else "failed"
+            self.update_progress(row.username, state=state, detail={
+                "cancelled": "已放弃", "stopped": "已停止", "failed": "任务未完成，请查看日志",
+            }[state])
         return result
 
     async def _run(self) -> RunResult:
@@ -85,8 +107,10 @@ class Workflow:
             async def execute(account, action):
                 async with semaphore:
                     self.control.check()
+                    self.update_progress(account.username, state="running", detail="登录中")
                     try:
                         async with pool.session(account) as forum:
+                            self.update_progress(account.username, detail="")
                             return await action(forum, account)
                     except Stopped:
                         raise
@@ -95,12 +119,19 @@ class Workflow:
                         message = self.config.redact(str(error))
                         self.results[account.username].error = message
                         self.log(f"[{account.username}] 失败：{message}")
+                        self.update_progress(account.username, state="failed", detail="失败，请查看日志")
                         return None
 
             async def gather(action, phase):
                 # 屏障放在协调器，所有账号都释放并发名额后才进入下一阶段。
                 self.phase = phase
                 self.debug(f"阶段开始：{phase}")
+                for account in accounts:
+                    is_question = phase == "补齐提问并冻结题池"
+                    total = target if is_question else (len(accounts) - 1) * target if phase == "互答" else 0
+                    current = min(target, self.question_counts.get(account.username, 0)) if is_question else 0
+                    self.update_progress(account.username, phase=phase, current=current, total=total,
+                                         state="waiting", detail="等待并发名额")
                 rows = await asyncio.gather(*(execute(a, action) for a in accounts), return_exceptions=True)
                 self.control.check()
                 for row in rows:
@@ -110,7 +141,10 @@ class Workflow:
 
             async def inspect(forum, account):
                 self.log(f"[{account.username}] 预检")
-                return await forum.snapshot(target)
+                snapshot = await forum.snapshot(target)
+                self.question_counts[account.username] = snapshot.count
+                self.update_progress(account.username, current=1, total=1, state="waiting", detail="预检完成")
+                return snapshot
 
             snapshots = await gather(inspect, "预检")
             if any(s is None for s in snapshots):
@@ -132,6 +166,7 @@ class Workflow:
 
             self.phase = "生成内容"
             self.debug("阶段开始：生成内容")
+            self.all_progress(phase="生成内容", current=0, total=0, state="running", detail="")
             questions = await self.generator.generate(course, questions)
             self._validate_generated(questions, accounts, target)
             self.save("generated.json", [asdict(q) for q in questions])
@@ -139,6 +174,7 @@ class Workflow:
             (self.directory / "preview.txt").write_text(preview, encoding="utf-8")
             self.log("内容已生成，等待预览确认")
             self.phase = "等待预览确认"
+            self.all_progress(phase="等待预览确认", state="waiting")
             accepted = await self.control.interruptible(self.confirm(preview))
             if not accepted:
                 self.log("已取消，未发布提问或回答")
@@ -152,6 +188,9 @@ class Workflow:
                         self.debug(f"[{account.username}] 补充提问：{question.key}")
                         if await forum.ensure_question(question.text, target):
                             self.results[account.username].published += 1
+                            current = min(target, self.question_counts[account.username]
+                                          + self.results[account.username].published)
+                            self.update_progress(account.username, current=current)
                 snapshot = await forum.snapshot(target)
                 if snapshot.count < target or len(snapshot.questions) != target:
                     raise ValueError("提问尚未达到目标数量")
@@ -166,6 +205,7 @@ class Workflow:
                 if len({q.url for q in frozen}) != target:
                     raise ValueError("公共题池中出现重复的问题 URL")
                 self.log(f"[{account.username}] 提问达标，贡献 {target} 道题")
+                self.update_progress(account.username, current=target, state="waiting", detail="等待其他账号提问达标")
                 return frozen
 
             groups = await gather(post_questions, "补齐提问并冻结题池")
@@ -186,9 +226,11 @@ class Workflow:
                     posted = await forum.answer(question.url, question.answers[account.username])
                     result.covered += 1
                     result.skipped += not posted
+                    self.update_progress(account.username, current=result.covered)
                     self.log(f"[{account.username}] 已覆盖 {result.covered}/{(len(accounts) - 1) * target}"
                              + ("（目标题已加载，无回答入口，跳过）" if not posted else "（已确认回答成功）")
                              + f" {question.url}")
+                self.update_progress(account.username, state="complete", detail="已完成")
                 return result
 
             await gather(answer_questions, "互答")

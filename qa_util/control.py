@@ -11,6 +11,11 @@ T = TypeVar("T")
 class Control:
     def __init__(self, stop: threading.Event | None = None):
         self.stop = stop if stop is not None else threading.Event()
+        self.on_status = None
+
+    def status(self, username: str, detail: str):
+        if self.on_status:
+            self.on_status(username, detail)
 
     def check(self):
         if self.stop.is_set():

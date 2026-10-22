@@ -109,6 +109,7 @@ class CaptchaGuard:
             self.paused = True
             self.epoch += 1
             self.log(f"[{self.username}] 等待人工完成验证码，仅暂停此账号")
+            self.control.status(self.username, "等待人工验证")
             await page.bring_to_front()
 
     async def _watch(self):
@@ -143,6 +144,7 @@ class CaptchaGuard:
                 break
             await self.control.sleep()
         self.paused = False
+        self.control.status(self.username, "")
         self.log(f"[{self.username}] 验证窗口已关闭，重新核对当前状态")
         return True
 
@@ -167,10 +169,12 @@ class PublishPacer:
                 remaining = 0 if self.last_sent is None else self.last_sent + self.interval - time.monotonic()
                 if remaining > 0:
                     self.log(f"[{self.username}] 发布间隔，等待 {remaining:.1f} 秒")
+                    self.control.status(self.username, "等待发送间隔")
                     await self.control.sleep(remaining)
                 # 正常等待同样可停止；验证码出现时不释放待发送的请求。
                 await guard.checkpoint()
                 self.control.check()
+                self.control.status(self.username, "")
                 self.last_sent = time.monotonic()
                 await route.continue_()
         except (Stopped, PlaywrightError):

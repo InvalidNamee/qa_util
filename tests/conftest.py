@@ -5,8 +5,16 @@ import pytest
 import pytest_asyncio
 from playwright.async_api import async_playwright
 
-from comment_util.control import Control
-from comment_util.models import Account, Config, LLMConfig, Question, Snapshot
+from qa_util.control import Control
+from qa_util.models import Account, Config, LLMConfig, Question, Snapshot
+
+
+@pytest.fixture(autouse=True)
+def llm_environment(tmp_path, monkeypatch):
+    monkeypatch.setattr("qa_util.config.ENV_FILE", tmp_path / ".env")
+    for key, value in {"LLM_BASE_URL": "https://api.example.test/v1", "LLM_MODEL": "model",
+                       "LLM_API_KEY": "secret-api-key"}.items():
+        monkeypatch.setenv(key, value)
 
 
 @pytest.fixture

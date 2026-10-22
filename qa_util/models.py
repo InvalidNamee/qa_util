@@ -35,7 +35,7 @@ class Config:
         result = asdict(self)
         for account in result["accounts"]:
             account["password"] = "***"
-        result["llm"]["api_key"] = "***"
+        result.pop("llm")
         return result
 
 
@@ -62,6 +62,16 @@ class AccountResult:
     covered: int = 0
     skipped: int = 0
     error: str = ""
+
+
+@dataclass(frozen=True)
+class AccountProgress:
+    username: str
+    phase: str = "等待开始"
+    current: int = 0
+    total: int = 0
+    state: str = "waiting"
+    detail: str = ""
 
 
 @dataclass

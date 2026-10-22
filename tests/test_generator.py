@@ -4,9 +4,9 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from comment_util.control import Control
-from comment_util.generator import Generator
-from comment_util.models import Question
+from qa_util.control import Control
+from qa_util.generator import Generator
+from qa_util.models import Question
 
 
 async def test_batches_use_real_old_titles_and_aliases_without_credentials(config):

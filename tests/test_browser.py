@@ -9,10 +9,10 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from comment_util.browser import (PUBLISH_URL, BrowserPool, CaptchaGuard, Forum, PublishPacer,
+from qa_util.browser import (PUBLISH_URL, BrowserPool, CaptchaGuard, Forum, PublishPacer,
                                   canonical_url, institution_login_url)
-from comment_util.control import Control
-from comment_util.models import Account, Stopped
+from qa_util.control import Control
+from qa_util.models import Account, Stopped
 
 
 @pytest.fixture
@@ -298,6 +298,8 @@ async def test_publish_cooldown_only_blocks_own_account_and_stop_releases_it(bro
     origin, state = site
     state["questions"] = [dict(id=1, owner="c", text="两个账号都能回答的问题？")]
     control = Control()
+    statuses = []
+    control.on_status = lambda username, detail: statuses.append((username, detail))
     waiting = asyncio.Event()
     forum, guard, context = await forum_for(browser, origin, control=control)
     other, other_guard, other_context = await forum_for(browser, origin, user="b")
@@ -307,6 +309,7 @@ async def test_publish_cooldown_only_blocks_own_account_and_stop_releases_it(bro
     task = asyncio.create_task(forum.answer(origin + "/qa.html#/web/questionDetail/123/1", "等待间隔的回答"))
     try:
         await asyncio.wait_for(waiting.wait(), timeout=4)
+        assert ("a", "等待发送间隔") in statuses
         assert await asyncio.wait_for(
             other.answer(origin + "/qa.html#/web/questionDetail/123/1", "另外账号可以立即回答"), timeout=4)
         assert not task.done()
@@ -529,12 +532,16 @@ async def test_one_account_wait_does_not_block_other_and_can_be_stopped(browser,
     origin, state = site
     state["question_mode"] = "before"
     control = Control()
+    statuses = []
+    control.on_status = lambda username, detail: statuses.append((username, detail))
     forum, guard, context = await forum_for(browser, origin, control=control)
     other, other_guard, other_context = await forum_for(browser, origin, user="b")
     task = asyncio.create_task(forum.ensure_question("等待验证的问题？", 1))
     try:
         await forum.page.locator(".yidun_popup").wait_for(state="visible", timeout=15_000)
         assert (await asyncio.wait_for(other.snapshot(1), timeout=5)).count == 0
+        assert ("a", "等待人工验证") in statuses
+        assert all(username == "a" for username, _ in statuses)
         assert not task.done()
         control.stop.set()
         with pytest.raises(Stopped):

@@ -7,10 +7,5 @@
   "max_concurrency": 8,
   "questions_per_account": 20,
   "publish_interval_seconds": 10,
-  "llm": {
-    "base_url": "https://api.deepseek.com/v1",
-    "model": "deepseek-flash",
-    "api_key": "填写密钥"
-  },
   "generation_prompt": ""
 }

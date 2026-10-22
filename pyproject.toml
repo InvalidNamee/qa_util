@@ -1,13 +1,17 @@
 [project]
-name = "comment-util"
+name = "qa_util"
 version = "0.1.0"
 description = "智慧树课程问答桌面工具"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["httpx>=0.28,<1", "playwright>=1.58,<2"]
+dependencies = [
+    "httpx>=0.28,<1",
+    "playwright>=1.58,<2",
+    "python-dotenv>=1,<2",
+]
 
 [project.scripts]
-comment-util = "comment_util.gui:main"
+qa_util = "qa_util.gui:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2"]
