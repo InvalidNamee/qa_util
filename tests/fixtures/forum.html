@@ -1,0 +1,92 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><title>本地课程问答夹具</title>
+<style>
+body{font-family:sans-serif} .question-item{min-height:540px;border:1px solid #ddd;padding:12px}
+[role=dialog]{position:fixed;inset:15% 20%;background:white;border:1px solid #aaa;padding:20px}
+.yidun_popup{position:fixed;inset:20%;background:white;border:2px solid #c44;z-index:9999;padding:30px}
+</style><body><main><h1>测试课程 共享课</h1><ul><li><div class="qa_jion_num">0</div><div class="qa_jion_name">我的提问</div></li></ul></main>
+<div id="tcaptcha_transform_dy" style="position:absolute;top:-1000000px;opacity:0">
+<iframe src="/captcha-idle" id="tcaptcha_iframe_dy"></iframe></div>
+<div class="yidun_popup" style="display:none">人工验证码夹具<button id="manual-solve">已人工完成验证</button></div>
+<script>
+let data, shown=2;
+const root=document.querySelector('main');
+const escapeHTML=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;');
+const request=async(path,body)=>{const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});return r.json()};
+const detailURL=id=>'/qa.html#/web/questionDetail/123/'+id+'?role=2&recruitId=456';
+function stats(){return `<h1>测试课程 共享课</h1><ul><li><div class="qa_jion_num">${data.questions.filter(q=>q.owner===data.user).length}</div><div class="qa_jion_name" onclick="location.hash='/web/myJoin/123?type=topic'">我的提问</div></li></ul>`}
+function dialog(name,placeholder,kind){
+  const box=document.createElement('div');box.setAttribute('role','dialog');box.setAttribute('aria-label',name);
+  box.innerHTML=`<textarea class="el-textarea__inner" placeholder="${placeholder}" maxlength="1000"></textarea><div class="up-btn">立即发布</div>`;
+  box.querySelector('.up-btn').onclick=()=>publish(box,kind);
+  document.body.appendChild(box);
+}
+async function publish(box,kind){
+  const text=box.querySelector('textarea').value;
+  const key=kind==='question'?'question_mode':'answer_mode';
+  const mode=data[key];
+  const manual=callback=>{
+    document.querySelector('.yidun_popup').style.display='block';
+    document.querySelector('#manual-solve').onclick=()=>{
+      sessionStorage.setItem(key,'1');
+      document.querySelector('.yidun_popup').style.display='none';
+      if(callback)callback();
+    };
+  };
+  const saved=async()=>{
+    const response=await request('/creditqa/gateway/t/v1/web/qa/'+(kind==='question'?'saveQuestion':'saveAnswer'),{text,id:data.id});
+    if(String(response.code)==='1010'){manual(saved);return;}
+    if(String(response.status)==='200' && response.rt){
+      if(!data.keep_publish_dialog)box.remove();
+    }else{
+      const error=document.createElement('div');error.className='el-message el-message--error';
+      error.textContent=response.msg||'发布失败';document.body.appendChild(error);
+    }
+  };
+  if(mode && !sessionStorage.getItem(key)){
+    if(mode==='after')await saved();
+    manual();
+  }else await saved();
+}
+function render(){
+  const route=location.hash.split('?')[0];
+  if(route.includes('/questionDetail/')){
+    data.id=route.split('/').pop();
+    const detail=awaitedDetail;
+    if(!detail || String(detail.rt.questionInfo.questionId)!==data.id)return;
+    const q=data.questions.find(q=>String(q.id)===data.id);
+    root.innerHTML=stats()+`<div class="question-content"><p>${escapeHTML(q.text)}</p></div><div>回答已加载</div>`;
+    if(q.owner!==data.user && !data.answered.includes(data.id) && !data.hide_answer_button){
+      const button=document.createElement('div');button.className='my-answer-btn';button.textContent='我来回答';
+      button.onclick=()=>dialog('我来回答','请输入您的回答','answer');root.appendChild(button);
+    }
+  }else if(route.includes('/myJoin/')){
+    const own=data.questions.filter(q=>q.owner===data.user);
+    root.innerHTML=stats()+'<ul>'+own.slice(0,shown).map(q=>
+      `<li class="question-item"><div class="question-content" title="${escapeHTML(q.text)}" onclick="window.open('${detailURL(q.id)}')">${escapeHTML(q.text)}</div></li>`).join('')+
+      '</ul>'+(shown>=own.length?'<p>没有更多了</p>':'');
+  }else{
+    root.innerHTML=stats()+'<div class="ask-btn" title="提问">提问</div>';
+    root.querySelector('.ask-btn').onclick=()=>dialog('提问','写下你的问题，以问号结尾','question');
+  }
+}
+let awaitedDetail;
+async function load(){
+  document.querySelectorAll('[role=dialog]').forEach(e=>e.remove());
+  data=await request('/creditqa/gateway/t/v1/web/qa/myParticipateQaNum');
+  if(data.background_request) fetch('/api/background').catch(()=>{});
+  const route=location.hash.split('?')[0];
+  if(route.includes('/questionDetail/')){
+    awaitedDetail=await request('/creditqa/gateway/t/v1/web/qa/getQuestionInfo?id='+route.split('/').pop());
+  }
+  render();
+}
+window.addEventListener('hashchange',event=>{
+  if(data?.reuse_detail && event.oldURL.includes('/questionDetail/') && event.newURL.includes('/questionDetail/'))return;
+  if(data?.reuse_home_counts && event.oldURL.split('#')[1]?.split('?')[0]===event.newURL.split('#')[1]?.split('?')[0])return;
+  load();
+});
+window.addEventListener('scroll',()=>{
+  if(location.hash.includes('/myJoin/')&&scrollY+innerHeight>=document.documentElement.scrollHeight-100){shown+=2;render()}
+});
+load();
+</script></body></html>
