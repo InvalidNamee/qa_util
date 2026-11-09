@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from qa_util.browser import (PUBLISH_URL, BrowserPool, CaptchaGuard, Forum, PublishPacer,
+from qa_util.browser import (PUBLISH_URL, BrowserSession, CaptchaGuard, Forum, PublishPacer,
                                   canonical_url, institution_login_url)
 from qa_util.control import Control
 from qa_util.models import Account, Stopped
@@ -38,6 +38,7 @@ def site():
                 user = self.headers.get("Cookie", "user=a").split("user=")[-1].split(";")[0]
                 self.reply(json.dumps({"status": "200", "rt": {"questionInfo": {
                     "questionId": q["id"], "courseId": 123, "content": q["text"],
+                    "answerNum": len([a for a in state["answers"] if a["id"] == question_id]),
                     "isAnswer": any(a["id"] == question_id and a["user"] == user for a in state["answers"]),
                 }}}).encode())
             elif self.path == "/creditqa/gateway/t/v1/web/qa/myParticipateQaNum":
@@ -106,6 +107,19 @@ async def test_snapshot_scrolls_and_closes_popup_tabs(browser, site):
         await cleanup(guard, context)
 
 
+async def test_snapshot_reads_cumulative_personal_answers_without_loading_question_list(browser, site):
+    origin, state = site
+    state["questions"] = [dict(id=1, owner="b", text="其他人的问题？")]
+    state["answers"] = [{"id": "1", "user": "a"}, {"id": "9", "user": "a"}, {"id": "1", "user": "b"}]
+    forum, guard, context = await forum_for(browser, origin)
+    try:
+        snapshot = await forum.snapshot(0)
+        assert snapshot.count == 0 and snapshot.answer_count == 2 and snapshot.questions == []
+        assert len(context.pages) == 1 and not state["posts"]
+    finally:
+        await cleanup(guard, context)
+
+
 @pytest.mark.parametrize("count", [0, 1])
 async def test_home_loaded_statistics_do_not_wait_for_unrelated_requests(browser, site, monkeypatch, count):
     origin, state = site
@@ -128,7 +142,7 @@ async def test_home_loaded_statistics_do_not_wait_for_unrelated_requests(browser
 
     monkeypatch.setattr(forum, "wait", quick_wait)
     try:
-        course, actual = await forum._home()
+        course, actual, answers = await forum._home()
         assert course == "测试课程" and actual == count
         assert started.is_set() and not release.is_set()
         assert not state["posts"] and not state["answers"]
@@ -154,10 +168,10 @@ async def test_home_waits_for_current_counts_instead_of_initial_zero(browser, si
     try:
         await asyncio.wait_for(started.wait(), timeout=3)
         await asyncio.sleep(0.6)
-        assert await forum.page.locator(".qa_jion_num").inner_text() == "0"
+        assert await forum.page.locator(".qa_jion_num").first.inner_text() == "0"
         assert not task.done()
         release.set()
-        assert await asyncio.wait_for(task, timeout=4) == ("测试课程", 1)
+        assert await asyncio.wait_for(task, timeout=4) == ("测试课程", 1, 0)
         assert not state["posts"] and not state["answers"]
     finally:
         release.set()
@@ -172,10 +186,10 @@ async def test_vnk_hash_change_reuses_loaded_counts_without_extra_refresh(browse
     forum, guard, context = await forum_for(browser, origin)
     requests = []
     try:
-        assert await forum._home() == ("测试课程", 1)
+        assert await forum._home() == ("测试课程", 1, 0)
         await forum.page.evaluate("history.replaceState(null,'',location.href+'&VNK=initial')")
         forum.page.on("request", lambda request: requests.append(request))
-        assert await asyncio.wait_for(forum._home(), timeout=4) == ("测试课程", 1)
+        assert await asyncio.wait_for(forum._home(), timeout=4) == ("测试课程", 1, 0)
         assert not requests
         assert await forum.page.evaluate("performance.getEntriesByType('navigation')[0].type") == "navigate"
     finally:
@@ -188,7 +202,7 @@ async def test_question_captcha_reconciles_without_duplicate_post(browser, site,
     state["question_mode"] = mode
     logs = []
     forum, guard, context = await forum_for(browser, origin, logs=logs)
-    task = asyncio.create_task(forum.ensure_question("新的课程问题？", 1))
+    task = asyncio.create_task(forum.post_question("新的课程问题？", lookback=1))
     try:
         if mode:
             popup = forum.page.locator(".yidun_popup")
@@ -199,7 +213,7 @@ async def test_question_captcha_reconciles_without_duplicate_post(browser, site,
             await forum.page.locator("#manual-solve").click()
         assert await asyncio.wait_for(task, timeout=20)
         assert state["posts"] == ["新的课程问题？"]
-        assert not await forum.ensure_question("新的课程问题？", 1)
+        assert (await forum.post_question("新的课程问题？", lookback=1)).status == "posted"
         assert state["posts"] == ["新的课程问题？"]
         if mode:
             assert sum("等待人工" in message for message in logs) == 1
@@ -224,7 +238,7 @@ async def test_answer_captcha_and_already_answered_skip(browser, site, mode):
             await forum.page.locator("#manual-solve").click()
         assert await asyncio.wait_for(task, timeout=20)
         assert len(state["answers"]) == 1
-        assert not await forum.answer(url, "不应重复发布")
+        assert (await forum.answer(url, "不应重复发布")).status == "already_answered"
         assert len(state["answers"]) == 1
     finally:
         await cleanup(guard, context)
@@ -247,29 +261,26 @@ async def test_three_answers_on_router_that_reuses_previous_detail(browser, site
         await cleanup(guard, context)
 
 
-async def test_publish_interval_is_shared_across_question_answer_and_new_context(config, site, monkeypatch):
+async def test_publish_interval_survives_browser_restart(config, site, monkeypatch):
     origin, state = site
     state["questions"] = [dict(id=1, owner="b", text="其他同学的问题？")]
-    config = replace(config, accounts=config.accounts[:1], forum_url=origin + "/qa.html#/web/home/123",
-                     publish_interval_seconds=1.5)
+    task = {"forum_url": origin + "/qa.html#/web/home/123", "publish_interval_seconds": 3}
     logs = []
 
     async def no_auth(self, *, reuse=False):
         await self.goto(self.home_url)
 
     monkeypatch.setattr(Forum, "login", no_auth)
-    async with BrowserPool(config, Control(), logs.append, headless=True) as pool:
-        async with pool.session(config.accounts[0]) as forum:
-            await forum.page.context.add_cookies([{"name": "user", "value": "a", "url": origin}])
-            assert await forum.ensure_question("准备提出的新问题？", 1)
-        assert not pool.browser.contexts
-        async with pool.session(config.accounts[0]) as forum:
-            assert await forum.answer(origin + "/qa.html#/web/questionDetail/123/1", "这是别人的题目的回答")
-            assert not await forum.answer(origin + "/qa.html#/web/questionDetail/123/1", "不应重复")
+    async with BrowserSession(config, Control(), logs.append, headless=True) as browser:
+        await browser.context.add_cookies([{"name": "user", "value": "a", "url": origin}])
+        forum = await browser.open(task)
+        assert (await forum.post_question("准备提出的新问题？", lookback=1)).status == "posted"
+    async with BrowserSession(config, Control(), logs.append, headless=True) as browser:
+        forum = await browser.open(task)
+        assert (await forum.answer(origin + "/qa.html#/web/questionDetail/123/1", "这是别人的题目的回答")).status == "posted"
+        assert (await forum.answer(origin + "/qa.html#/web/questionDetail/123/1", "不应重复")).status == "already_answered"
     sends = state["send_times"]
-    assert len(sends) == 2
-    assert sends[0]["path"].endswith("saveQuestion") and sends[1]["path"].endswith("saveAnswer")
-    assert sends[1]["time"] - sends[0]["time"] >= 1.45
+    assert len(sends) == 2 and sends[1]["time"] - sends[0]["time"] >= 2.95
     assert any("发布间隔" in line for line in logs)
 
 
@@ -352,7 +363,7 @@ async def test_disappearing_button_alone_does_not_confirm_publication(browser, s
 
     await context.route("**/qa/saveAnswer", rejected_answer)
     try:
-        with pytest.raises(RuntimeError, match="提交后未确认本人已回答"):
+        with pytest.raises(RuntimeError, match="发布后未确认本人已回答"):
             await forum.answer(origin + "/qa.html#/web/questionDetail/123/1", "未实际保存的回答")
         assert not state["answers"]
     finally:
@@ -455,28 +466,27 @@ async def test_browser_validation_error_is_reported_without_a_publish_request(br
         await cleanup(guard, context)
 
 
-async def test_failed_publication_saves_page_and_sanitized_response(config, site, tmp_path, monkeypatch):
+async def test_failed_publication_saves_sanitized_snapshot(config, site, tmp_path, monkeypatch):
     origin, state = site
     state["questions"] = [dict(id=1, owner="b", text="目标题目？")]
-    config = replace(config, forum_url=origin + "/qa.html#/web/home/123")
+    task = {"forum_url": origin + "/qa.html#/web/home/123"}
 
     async def no_auth(self, *, reuse=False):
         await self.goto(self.home_url)
 
     monkeypatch.setattr(Forum, "login", no_auth)
-    async with BrowserPool(config, Control(), lambda _: None, headless=True, output_directory=tmp_path) as pool:
-        with pytest.raises(RuntimeError, match="发布失败"):
-            async with pool.session(config.accounts[0]) as forum:
-                await forum.page.context.route("**/qa/saveAnswer", lambda route: route.fulfill(
-                    json={"status": "400", "msg": "服务端拒绝 " + config.accounts[0].password}))
-                await forum.answer(origin + "/qa.html#/web/questionDetail/123/1", "已确认内容")
-        assert not pool.browser.contexts
-    diagnostic = (tmp_path / "failure-a1.json").read_text()
-    assert config.accounts[0].password not in diagnostic
+    async with BrowserSession(config, Control(), lambda _: None, headless=True, output_directory=tmp_path) as browser:
+        forum = await browser.open(task)
+        await browser.context.route("**/qa/saveAnswer", lambda route: route.fulfill(
+            json={"status": "400", "msg": "服务端拒绝 " + config.account.password}))
+        with pytest.raises(RuntimeError, match="发布失败") as failure:
+            await forum.answer(origin + "/qa.html#/web/questionDetail/123/1", "待发布内容")
+        await browser.failure_snapshot(failure.value)
+    diagnostic = (tmp_path / "failure.json").read_text()
+    assert config.account.password not in diagnostic
     assert json.loads(diagnostic)["publish"]["status"] == "400"
-    assert "Traceback" in json.loads(diagnostic)["traceback"]
-    assert json.loads(diagnostic)["captcha"] == {"paused": False, "epoch": 0, "monitor_error": None}
-    assert (tmp_path / "failure-a1.png").read_bytes().startswith(b"\x89PNG")
+    assert json.loads(diagnostic)["captcha"] == {"paused": False, "epoch": 0}
+    assert (tmp_path / "failure.png").read_bytes().startswith(b"\x89PNG")
     assert not state["answers"]
 
 
@@ -536,7 +546,7 @@ async def test_one_account_wait_does_not_block_other_and_can_be_stopped(browser,
     control.on_status = lambda username, detail: statuses.append((username, detail))
     forum, guard, context = await forum_for(browser, origin, control=control)
     other, other_guard, other_context = await forum_for(browser, origin, user="b")
-    task = asyncio.create_task(forum.ensure_question("等待验证的问题？", 1))
+    task = asyncio.create_task(forum.post_question("等待验证的问题？", lookback=1))
     try:
         await forum.page.locator(".yidun_popup").wait_for(state="visible", timeout=15_000)
         assert (await asyncio.wait_for(other.snapshot(1), timeout=5)).count == 0
@@ -606,43 +616,72 @@ def test_urls_keep_course_context_and_strip_transient_parameters():
     assert urlsplit(institution_login_url()).hostname == "cas.upc.edu.cn"
 
 
-async def test_real_pool_reuses_only_its_own_account_storage(config, site, monkeypatch):
+async def test_browser_state_persists_on_disk_and_is_isolated_by_account(config, site, monkeypatch):
     origin, _ = site
+    task = {"forum_url": origin + "/qa.html#/web/home/123"}
 
     async def no_auth(self, *, reuse=False):
-        pass
+        await self.goto(self.home_url)
 
     monkeypatch.setattr(Forum, "login", no_auth)
-    async with BrowserPool(config, Control(), lambda _: None, headless=True) as pool:
-        async with pool.session(config.accounts[0]) as forum:
-            await forum.page.context.add_cookies([{"name": "identity", "value": "a", "url": origin}])
-            await forum.page.goto(origin + "/qa.html#/web/home/123")
-            await forum.page.evaluate("localStorage.setItem('account-marker', 'a')")
-        assert not pool.browser.contexts
-        async with pool.session(config.accounts[1]) as forum:
-            assert not await forum.page.context.cookies(origin)
-            await forum.page.goto(origin + "/qa.html#/web/home/123")
-            assert await forum.page.evaluate("localStorage.getItem('account-marker')") is None
-        async with pool.session(config.accounts[0]) as forum:
-            cookies = await forum.page.context.cookies(origin)
-            assert cookies[0]["value"] == "a"
-            await forum.page.goto(origin + "/qa.html#/web/home/123")
-            assert await forum.page.evaluate("localStorage.getItem('account-marker')") == "a"
-        assert not pool.browser.contexts
-    assert not pool.browser.is_connected()
+    async with BrowserSession(config, Control(), lambda _: None, headless=True) as browser:
+        forum = await browser.open(task)
+        await browser.context.add_cookies([{"name": "identity", "value": "a", "url": origin}])
+        await forum.page.evaluate("localStorage.setItem('account-marker', 'a')")
+    assert (config.data_directory / "login.json").stat().st_mode & 0o777 == 0o600
+    other = replace(config, account=Account("b", "b-password"), data_directory=config.data_directory.parent / "client-b")
+    async with BrowserSession(other, Control(), lambda _: None, headless=True) as browser:
+        assert not await browser.context.cookies(origin)
+        forum = await browser.open(task)
+        assert await forum.page.evaluate("localStorage.getItem('account-marker')") is None
+    async with BrowserSession(config, Control(), lambda _: None, headless=True) as browser:
+        assert any(cookie["value"] == "a" for cookie in await browser.context.cookies(origin))
+        forum = await browser.open(task)
+        assert await forum.page.evaluate("localStorage.getItem('account-marker')") == "a"
+    with pytest.raises(ValueError, match="不属于当前账号"):
+        async with BrowserSession(replace(config, account=Account("b", "b-password")), Control(), lambda _: None, headless=True):
+            pytest.fail("不应读取另一账号状态")
 
 
-async def test_real_pool_stop_closes_browser_without_waiting_for_captcha(config, monkeypatch):
+async def test_stop_closes_browser_without_waiting_for_captcha(config):
     control = Control()
+    async with BrowserSession(config, control, lambda _: None, headless=True) as browser:
+        await browser.page.set_content('<div class="yidun_popup" style="height:100px">验证</div>')
+        control.stop.set()
+        await asyncio.wait_for(browser.stop_task, timeout=3)
+        assert not browser.browser.is_connected()
+
+
+async def test_answer_threshold_and_unavailable_are_distinct(browser, site):
+    origin, state = site
+    state["questions"] = [dict(id=1, owner="b", text="已有其他同学回答的题目？")]
+    state["answers"] = [dict(id="1", user="external", text="外部回答")]
+    forum, guard, context = await forum_for(browser, origin)
+    url = origin + "/qa.html#/web/questionDetail/123/1"
+    try:
+        result = await forum.answer(url, "不应发送", answer_target=1)
+        assert result.status == "threshold_met" and result.question.answer_count == 1
+        state["hide_answer_button"] = True
+        result = await forum.answer(url, "也不应发送", answer_target=2)
+        assert result.status == "unavailable" and result.question.answer_count == 1
+        assert len(state["answers"]) == 1
+    finally:
+        await cleanup(guard, context)
+
+
+async def test_server_denial_at_send_gate_prevents_publication(config, site, monkeypatch):
+    origin, state = site
+    state["questions"] = [dict(id=1, owner="b", text="目标题目？")]
 
     async def no_auth(self, *, reuse=False):
-        pass
+        await self.goto(self.home_url)
+
+    async def deny():
+        raise RuntimeError("服务端任务已暂停")
 
     monkeypatch.setattr(Forum, "login", no_auth)
-    async with BrowserPool(config, control, lambda _: None, headless=True) as pool:
-        async with pool.session(config.accounts[0]) as forum:
-            await forum.page.set_content('<div class="yidun_popup" style="height:100px">验证</div>')
-            control.stop.set()
-            await asyncio.wait_for(pool.stop_task, timeout=3)
-            assert not pool.browser.is_connected()
-    assert not pool.browser.contexts
+    async with BrowserSession(config, Control(), lambda _: None, headless=True, before_send=deny) as browser:
+        forum = await browser.open({"forum_url": origin + "/qa.html#/web/home/123"})
+        with pytest.raises(RuntimeError, match="服务端任务已暂停"):
+            await forum.answer(origin + "/qa.html#/web/questionDetail/123/1", "不应该实际发送的回答")
+        assert not state["answers"]

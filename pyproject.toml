@@ -1,26 +1,26 @@
 [project]
-name = "qa_util"
+name = "qa-util-development"
 version = "0.1.0"
-description = "智慧树课程问答桌面工具"
-readme = "README.md"
+description = "qa_util 两端联合开发与集成测试环境"
 requires-python = ">=3.13"
-dependencies = [
-    "httpx>=0.28,<1",
-    "playwright>=1.58,<2",
-    "python-dotenv>=1,<2",
-]
-
-[project.scripts]
-qa_util = "qa_util.gui:main"
+dependencies = []
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2"]
+dev = [
+    "qa-util-client",
+    "qa-util-server",
+    "pytest>=8,<10",
+    "pytest-asyncio>=1,<2",
+]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+qa-util-client = { path = "client", editable = true }
+qa-util-server = { path = "server", editable = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
-
+testpaths = ["server/tests", "client/tests", "tests"]
+pythonpath = ["server/tests", "tests"]

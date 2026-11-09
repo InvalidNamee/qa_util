@@ -1,0 +1,83 @@
+{% extends 'base.html' %}{% block content %}
+{% macro account_label(a) %}{{ a.alias or a.username }}{% if a.alias %} <small>（{{ a.username }}）</small>{% endif %}{% endmacro %}
+<details open><summary>账号管理（{{ accounts|length }}）</summary>
+<button type="button" onclick="registerAccount()">登记账号</button>
+<table><tr><th>账号</th><th>客户端状态</th><th class="account-actions">操作</th></tr>{% for a in accounts %}<tr><td>{{ account_label(a) }}</td><td>{{ a.client_status if a.session_until > now else '离线' }}</td><td class="account-actions"><button type="button" data-url="{{ url_for('rotate_token',account_id=a.id) }}" data-username="{{ a.username }}" onclick="showToken(this)">接入码</button><button type="button" data-url="{{ url_for('set_alias',account_id=a.id) }}" data-alias="{{ a.alias }}" data-username="{{ a.username }}" onclick="editAlias(this)">修改别名</button><button type="button" class="danger" data-url="{{ url_for('delete_account',account_id=a.id) }}" data-username="{{ a.username }}" data-alias="{{ a.alias }}" onclick="deleteAccount(this)">删除</button></td></tr>{% endfor %}</table></details>
+<dialog id="register-dialog" class="management-dialog" aria-labelledby="register-heading"><form method="post" id="register-form" action="{{ url_for('create_account') }}">
+<input type="hidden" name="csrf" value="{{ csrf() }}"><h2 id="register-heading">登记账号</h2>
+<label for="register-username">论坛账号</label><input id="register-username" name="username" required>
+<label for="register-alias">别名</label><input id="register-alias" name="alias" maxlength="100" placeholder="选填">
+<div class="actions"><button type="button" onclick="document.getElementById('register-dialog').close()">取消</button><button>登记并生成接入码</button></div>
+</form></dialog>
+<dialog id="alias-dialog" class="management-dialog" aria-labelledby="alias-heading"><form method="post" id="alias-form">
+<input type="hidden" name="csrf" value="{{ csrf() }}"><h2 id="alias-heading">修改别名</h2>
+<label for="alias-input" id="alias-label">别名</label><input id="alias-input" name="alias" maxlength="100" placeholder="留空则显示原账号">
+<div class="actions"><button type="button" onclick="document.getElementById('alias-dialog').close()">取消</button><button>保存</button></div>
+</form></dialog>
+<dialog id="delete-account-dialog" class="management-dialog" aria-labelledby="delete-account-heading"><form method="post" id="delete-account-form">
+<input type="hidden" name="csrf" value="{{ csrf() }}"><h2 id="delete-account-heading">删除账号</h2>
+<p id="delete-account-name"></p><p class="muted">删除账号及本工具中的关联题池和执行记录，并暂停相关运行任务。</p>
+<div class="actions"><button type="button" onclick="document.getElementById('delete-account-dialog').close()">取消</button><button class="danger">删除账号</button></div>
+</form></dialog>
+<dialog id="token-dialog" class="management-dialog" aria-labelledby="token-heading">
+<h2 id="token-heading">接入码</h2><p id="token-account">{{ issued_username or '' }}</p>
+<div id="issued-token"{% if not issued_token %} hidden{% endif %}>
+<p class="muted">接入码仅本次显示，请复制保存。</p><input id="token-value" aria-label="新接入码" value="{{ issued_token or '' }}" readonly onclick="this.select()">
+<div class="actions"><button type="button" onclick="document.getElementById('token-dialog').close()">关闭</button></div>
+</div>
+<form method="post" id="token-form"{% if issued_token %} hidden{% endif %}>
+<input type="hidden" name="csrf" value="{{ csrf() }}"><p class="muted">重置会使旧接入码失效，请同步更新客户端配置。</p>
+<div class="actions"><button type="button" onclick="document.getElementById('token-dialog').close()">取消</button><button>重置接入码</button></div>
+</form></dialog>
+<details open><summary>创建论坛任务</summary><form method="post" action="{{ url_for('create_task') }}">
+<input type="hidden" name="csrf" value="{{ csrf() }}"><p><label>名称 <input name="name" required></label></p>
+<p><label>论坛链接 <input type="url" name="forum_url" required></label></p>
+<p><label>每号提问目标 <input type="number" name="question_target" min="1" value="20" required oninput="document.getElementById('account-answer-target').max=this.value"></label><label>每号回答目标 <input id="account-answer-target" type="number" name="account_answer_target" min="1" max="20" value="20" required></label><label>每题回答阈值 <input type="number" name="answer_target" min="1" value="5" required></label></p>
+<p>参与账号：{% for a in accounts %}<label><input type="checkbox" name="accounts" value="{{ a.id }}">{{ account_label(a) }}</label>{% endfor %}</p><button>创建任务</button></form></details>
+<p class="muted">刷新页面更新进度。每号回答目标不大于提问目标，已有“我的回答”抵扣个人目标；个人两项目标与每题阈值全部达标才完成。个人达标后仍补题目阈值。运行参数固定，调整目标请新建任务。</p>
+{% for t in tasks %}<section><h2>{{ t.name }} · {{ {'draft':'未启动','running':'运行中','paused':'已暂停','complete':'已完成'}[t.state] }}</h2>
+<p><a href="{{ t.forum_url }}" target="_blank" rel="noreferrer">打开论坛</a> · 每号提问 {{ t.question_target }} 道 · 每号回答 {{ t.account_answer_target if t.account_answer_target else '未设置（旧任务）' }} 条 · 每题至少 {{ t.answer_target }} 条回答</p>
+<div class="actions">{% if t.state != 'complete' and t.members %}<form method="post" action="{{ url_for('task_action',task_id=t.id,action='pause' if t.state=='running' else 'start') }}"><input type="hidden" name="csrf" value="{{ csrf() }}"><button>{{ '暂停' if t.state=='running' else '启动 / 恢复' }}</button></form>{% endif %}
+{% if t.error %}<form method="post" action="{{ url_for('task_action',task_id=t.id,action='retry') }}"><input type="hidden" name="csrf" value="{{ csrf() }}"><button>重试失败操作</button></form>{% endif %}</div>
+{% if t.error %}<p class="error">{{ t.error }}</p>{% endif %}
+{% if t.pending_reconciliation %}<p class="muted">有 {{ t.pending_reconciliation|length }} 个正在提交或等待原客户端核对的操作。</p>{% endif %}
+{% if not t.members %}<p class="muted">任务已无参与账号，请新建任务。</p>{% endif %}
+<table><tr><th>账号</th><th>累计提问 / 目标</th><th>累计回答 / 目标</th></tr>{% for m in t.members %}<tr><td>{{ account_label(m) }}</td><td>{{ m.question_count if m.synced_at is not none else '尚未同步' }} / {{ t.question_target }}</td><td>{{ m.answer_count if m.answer_count is not none else '尚未同步' }} / {{ t.account_answer_target if t.account_answer_target else '未设置' }}</td></tr>{% endfor %}</table>
+<details open><summary>题池与回答进度（{{ t.questions|length }} 道）</summary><table><tr><th>作者</th><th>题目</th><th>网页回答 / 阈值</th></tr>{% for q in t.questions %}<tr><td>{{ account_label(q) }}</td><td>{% if q.url %}<a href="{{ q.url }}" target="_blank" rel="noreferrer">{{ q.text }}</a>{% else %}{{ q.text or '等待生成' }} <small>尚未发布</small>{% endif %}</td><td>{{ q.answer_count }} / {{ t.answer_target }}{% if q.url and q.answer_count < t.answer_target %}<br><small>待补答；无合适账号时继续等待</small>{% endif %}</td></tr>{% endfor %}</table></details>
+</section>{% else %}<section>还没有论坛任务。</section>{% endfor %}
+<script>
+function registerAccount() {
+  document.getElementById('register-form').reset();
+  document.getElementById('register-dialog').showModal();
+  document.getElementById('register-username').focus();
+}
+function editAlias(button) {
+  const dialog = document.getElementById('alias-dialog');
+  const input = document.getElementById('alias-input');
+  document.getElementById('alias-form').action = button.dataset.url;
+  document.getElementById('alias-label').textContent = button.dataset.username + ' 的别名';
+  input.value = button.dataset.alias;
+  dialog.showModal();
+  input.focus();
+  input.select();
+}
+function deleteAccount(button) {
+  document.getElementById('delete-account-form').action = button.dataset.url;
+  document.getElementById('delete-account-name').textContent = button.dataset.alias
+    ? button.dataset.alias + '（' + button.dataset.username + '）' : button.dataset.username;
+  document.getElementById('delete-account-dialog').showModal();
+}
+function showToken(button) {
+  document.getElementById('token-account').textContent = button.dataset.username;
+  document.getElementById('token-form').action = button.dataset.url;
+  document.getElementById('token-form').hidden = false;
+  document.getElementById('issued-token').hidden = true;
+  document.getElementById('token-value').value = '';
+  document.getElementById('token-dialog').showModal();
+}
+{% if issued_token %}
+document.getElementById('token-dialog').showModal();
+document.getElementById('token-value').select();
+{% endif %}
+</script>
+{% endblock %}

@@ -1,0 +1,6 @@
+{
+  "server_url": "http://127.0.0.1:8000",
+  "access_token": "管理员为此账号生成的独立接入码",
+  "account": {"username": "学号", "password": "论坛密码"},
+  "data_directory": "client-data/学号"
+}

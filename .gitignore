@@ -3,10 +3,17 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 config.json
+client.json
+client-data/
+server-data/
 .env
 .env.*
 !.env.example
 runs/
 output/
 .DS_Store
+dist/
+build/
+.dist/
+*.egg-info/
 

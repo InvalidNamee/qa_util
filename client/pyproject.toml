@@ -1,0 +1,30 @@
+[project]
+name = "qa-util-client"
+version = "0.1.0"
+description = "智慧树问答单账号 Playwright 桌面客户端"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28,<1",
+    "playwright>=1.58,<2",
+]
+
+[project.scripts]
+qa_util = "qa_util.gui:main"
+
+[dependency-groups]
+build = [
+    "pyinstaller>=6.22,<7",
+]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qa_util"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

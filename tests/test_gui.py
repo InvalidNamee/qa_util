@@ -2,12 +2,14 @@ import asyncio
 import json
 import time
 import tkinter as tk
+from dataclasses import replace
 
 from qa_util.gui import App
-from qa_util.models import AccountProgress, RunResult
+from client_fakes import FastControl, Website, flask_transport
+from server_support import forum_url
 
 
-def pump(root, predicate, timeout=4):
+def pump(root, predicate, timeout=5):
     end = time.monotonic() + timeout
     while not predicate():
         root.update()
@@ -17,136 +19,97 @@ def pump(root, predicate, timeout=4):
     root.update()
 
 
-def test_gui_preview_cancel_is_responsive_and_redacts(config, tmp_path, monkeypatch):
-    path = tmp_path / "config.json"
-    from dataclasses import asdict
-    path.write_text(json.dumps(asdict(config)))
+def write_config(config, path):
+    raw = config.public_dict()
+    raw["access_token"] = config.access_token
+    raw["account"]["password"] = config.account.password
+    path.write_text(json.dumps(raw))
 
-    class PreviewWorkflow:
-        def __init__(self, config, confirm, log, control, progress):
-            self.confirm, self.log, self.control = confirm, log, control
-            self.directory = tmp_path
 
-        async def run(self):
-            self.log("准备预览")
-            return RunResult("complete" if await self.confirm("生成的问题及回答") else "cancelled")
-
-    monkeypatch.setattr("qa_util.gui.Workflow", PreviewWorkflow)
+def test_single_account_gui_displays_progress_without_logs_or_preview(config, tmp_path, monkeypatch):
+    path = tmp_path / "client.json"
+    write_config(config, path)
     root = tk.Tk()
     root.withdraw()
     app = App(root, path)
     try:
-        assert config.accounts[0].password not in app.config_view.get("1.0", "end")
-        assert config.llm.api_key not in app.config_view.get("1.0", "end")
-        app.start()
-        pump(root, lambda: app.preview_window is not None)
-        assert app.worker.is_alive()
-        app.finish_preview(False)
-        pump(root, lambda: not app.worker.is_alive())
-        pump(root, lambda: "已放弃" in app.status.get())
-        assert not hasattr(app, "logs")
+        assert config.account.password not in app.config_view.get("1.0", "end")
+        assert config.access_token not in app.config_view.get("1.0", "end")
+        assert not hasattr(app, "logs") and not hasattr(app, "preview_window")
+        app.messages.put(("progress", {"phase": "补答", "detail": "等待人工验证", "task_name": "网络课程",
+                                       "question_current": 20, "question_total": 20,
+                                       "pool_current": 3, "pool_total": 5, "answers_done": 8}))
+        pump(root, lambda: "等待人工验证" in app.status.get())
+        assert app.question_bar["value"] == app.question_bar["maximum"] == 20
+        assert app.pool_bar["value"] == 3 and app.pool_bar["maximum"] == 5
+        app.directory = tmp_path
+        (tmp_path / "debug.log").write_text("日志")
+        opened = []
+        monkeypatch.setattr("qa_util.gui.sys.platform", "darwin")
+        monkeypatch.setattr("qa_util.gui.subprocess.Popen", opened.append)
+        app.open_log()
+        assert opened == [["open", str(tmp_path / "debug.log")]]
     finally:
-        app.stop.set()
-        app.finish_preview(False)
-        if app.worker:
-            app.worker.join(timeout=3)
         root.destroy()
 
 
-def test_close_during_background_wait_stops_worker(config, tmp_path, monkeypatch):
-    from dataclasses import asdict
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(asdict(config)))
+def test_gui_drives_real_client_protocol_and_keeps_complete_progress(app, service, config, tmp_path, monkeypatch):
+    from qa_util.workflow import ClientRunner
+    aid, token = service.create_account("a")
+    task = service.create_task("GUI任务", forum_url(), 1, 1, [aid])
+    service.set_task_state(task, "running")
+    site = Website()
+    site.add(forum_url(), "a", "已经有回答的问题是什么？", answers=1)
+    site.historical_answers[(forum_url(), "a")] = 1
+    cfg = replace(config, access_token=token)
+    path = tmp_path / "client.json"
+    write_config(cfg, path)
 
-    class WaitingWorkflow:
-        def __init__(self, config, confirm, log, control, progress):
+    def runner(*args, **kwargs):
+        kwargs["control"] = FastControl(kwargs["control"].stop)
+        return ClientRunner(*args, **kwargs, browser_factory=site.factory, transport=flask_transport(app))
+
+    monkeypatch.setattr("qa_util.gui.ClientRunner", runner)
+    root = tk.Tk()
+    root.withdraw()
+    ui = App(root, path)
+    try:
+        ui.start()
+        pump(root, lambda: ui.pool_bar["value"] == 1)
+        assert ui.question_bar["value"] == 1
+        assert ui.worker.is_alive()  # 完成后等待管理员的新任务。
+        ui.request_stop()
+        pump(root, lambda: not ui.worker.is_alive())
+        pump(root, lambda: "已停止" in ui.status.get())
+        assert ui.pool_bar["value"] == ui.pool_bar["maximum"] == 1
+        assert (ui.directory / "debug.log").exists()
+    finally:
+        ui.stop.set()
+        if ui.worker:ui.worker.join(timeout=3)
+        root.destroy()
+
+
+def test_close_during_wait_stops_background_worker(config, tmp_path, monkeypatch):
+    path = tmp_path / "client.json"
+    write_config(config, path)
+
+    class WaitingRunner:
+        def __init__(self, config, control, progress):
             self.control, self.directory = control, tmp_path
 
         async def run(self):
             while not self.control.stop.is_set():
                 await asyncio.sleep(0.01)
-            return RunResult("stopped")
+            return "stopped"
 
-    monkeypatch.setattr("qa_util.gui.Workflow", WaitingWorkflow)
+    monkeypatch.setattr("qa_util.gui.ClientRunner", WaitingRunner)
     root = tk.Tk()
     root.withdraw()
-    app = App(root, path)
-    app.start()
+    ui = App(root, path)
+    ui.start()
     root.update()
-    app.close()
-    app.worker.join(timeout=3)
-    assert not app.worker.is_alive() and app.stop.is_set()
+    ui.close()
+    ui.worker.join(timeout=3)
+    assert not ui.worker.is_alive()
     root.update()
     root.destroy()
-
-
-def test_progress_retains_count_during_captcha_and_opens_log(config, tmp_path, monkeypatch):
-    from dataclasses import asdict, replace
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(asdict(config)))
-    root = tk.Tk()
-    root.withdraw()
-    app = App(root, path)
-    try:
-        progress = AccountProgress(config.accounts[0].username, "互答", 3, 10, "running")
-        app.messages.put(("progress", progress))
-        pump(root, lambda: "3/10" in app.progress_rows[progress.username]["label"].get())
-        row = app.progress_rows[progress.username]
-        assert row["bar"]["value"] == 3 and row["bar"]["maximum"] == 10
-        app.update_progress(replace(progress, detail="等待人工验证"))
-        assert row["bar"]["value"] == 3
-        assert "等待人工验证" in row["label"].get()
-        assert app.progress_rows[config.accounts[1].username]["label"].get() == "等待开始"
-        app.directory = tmp_path
-        log = tmp_path / "debug.log"
-        log.write_text("诊断信息只存在文件")
-        opened = []
-        monkeypatch.setattr("qa_util.gui.sys.platform", "darwin")
-        monkeypatch.setattr("qa_util.gui.subprocess.Popen", opened.append)
-        app.open_log()
-        assert opened == [["open", str(log)]]
-        app.update_progress(replace(progress, total=0, current=0, phase="生成内容"))
-        assert row["busy"]
-        app.messages.put(("done", ("failed", str(tmp_path))))
-        pump(root, lambda: "失败" in app.status.get())
-        assert not row["busy"]
-    finally:
-        root.destroy()
-
-
-def test_gui_receives_real_workflow_progress_and_keeps_logs_in_files(config, tmp_path, monkeypatch):
-    from dataclasses import asdict
-    from qa_util.workflow import Workflow
-    from conftest import FakeGenerator, FakePool
-
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(asdict(config)))
-    pool = FakePool(config)
-
-    def workflow_factory(*args, **kwargs):
-        return Workflow(*args, **kwargs, output_root=tmp_path, browser_factory=lambda *_: pool,
-                        generator=FakeGenerator())
-
-    monkeypatch.setattr("qa_util.gui.Workflow", workflow_factory)
-    root = tk.Tk()
-    root.withdraw()
-    app = App(root, path)
-    try:
-        app.start()
-        pump(root, lambda: app.preview_window is not None)
-        app.finish_preview(True)
-        pump(root, lambda: not app.worker.is_alive())
-        pump(root, lambda: "全部完成" in app.status.get())
-        for account in config.accounts:
-            row = app.progress_rows[account.username]
-            assert row["bar"]["value"] == row["bar"]["maximum"] == 10
-            assert "已完成" in row["label"].get()
-        assert (app.directory / "run.log").exists() and (app.directory / "debug.log").exists()
-        assert "全部账号已完成" in (app.directory / "run.log").read_text()
-        assert str(app.log_button["state"]) == "normal"
-    finally:
-        app.stop.set()
-        app.finish_preview(False)
-        if app.worker:
-            app.worker.join(timeout=3)
-        root.destroy()

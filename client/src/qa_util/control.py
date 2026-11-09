@@ -12,6 +12,13 @@ class Control:
     def __init__(self, stop: threading.Event | None = None):
         self.stop = stop if stop is not None else threading.Event()
         self.on_status = None
+        self.online = True
+
+    async def wait_online(self):
+        paused = not self.online
+        while not self.online:
+            await self.sleep()
+        return paused
 
     def status(self, username: str, detail: str):
         if self.on_status:

@@ -1,0 +1,3 @@
+{% extends 'base.html' %}{% block content %}<section><h2>管理员登录</h2>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf() }}"><label>管理密码 <input type="password" name="password" required></label><button>登录</button></form>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}</section>{% endblock %}
