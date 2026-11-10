@@ -67,7 +67,7 @@ def test_gui_drives_real_client_protocol_and_keeps_complete_progress(app, servic
 
     def runner(*args, **kwargs):
         kwargs["control"] = FastControl(kwargs["control"].stop)
-        return ClientRunner(*args, **kwargs, browser_factory=site.factory, transport=flask_transport(app))
+        return ClientRunner(*args, **kwargs, forum_factory=site.factory, transport=flask_transport(app))
 
     monkeypatch.setattr("qa_util.gui.ClientRunner", runner)
     root = tk.Tk()

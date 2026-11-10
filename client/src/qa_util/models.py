@@ -12,6 +12,7 @@ class Question:
     owner: str
     text: str
     url: str = ""
+    answer_count: int | None = None
 
 
 @dataclass
@@ -32,13 +33,19 @@ class QuestionState:
 
 
 @dataclass(frozen=True)
-class BrowserResult:
+class ForumResult:
     status: str
     question: QuestionState | None = None
 
 
 class Stopped(Exception):
     """用户主动停止，不是执行失败。"""
+
+
+class ManualVerification(RuntimeError):
+    def __init__(self, message, *, rejected=False):
+        super().__init__(message)
+        self.rejected = rejected
 
 
 def normalize(text: str) -> str:

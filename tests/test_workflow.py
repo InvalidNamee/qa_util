@@ -40,7 +40,7 @@ async def test_two_clients_roll_forward_without_preview_and_without_credentials_
         return None
 
     runners = [ClientRunner(client_config(config, name, token), control=FastControl(),
-                            browser_factory=site.factory, transport=flask_transport(app, inspect))
+                            forum_factory=site.factory, transport=flask_transport(app, inspect))
                for name, (aid, token) in zip("ab", accounts)]
     app.extensions["qa_worker"].start()
     running = [asyncio.create_task(r.run()) for r in runners]
@@ -65,7 +65,7 @@ async def test_personal_goals_complete_even_when_questions_already_meet_threshol
     for name in "abc":
         site.add(forum_url(), name, f"{name}的问题是什么？", answers=1)
     runners = [ClientRunner(client_config(config, name, token), control=FastControl(),
-                            browser_factory=site.factory, transport=flask_transport(app))
+                            forum_factory=site.factory, transport=flask_transport(app))
                for name, (_, token) in zip("abc", accounts)]
     app.extensions["qa_worker"].start()
     running = [asyncio.create_task(runner.run()) for runner in runners]
@@ -94,7 +94,7 @@ async def test_restart_discards_operation_removed_with_another_account(app, serv
     private_json(cfg.data_directory / "operation.json", {"operation": operation, "stage": "prepared"})
     service.delete_account(a[0])
     site = Website()
-    runner = ClientRunner(cfg, control=FastControl(), browser_factory=site.factory, transport=flask_transport(app))
+    runner = ClientRunner(cfg, control=FastControl(), forum_factory=site.factory, transport=flask_transport(app))
     running = asyncio.create_task(runner.run())
     try:
         await until(lambda: not runner.journal_path.exists() and runner.view["phase"] == "等待任务", [running])
@@ -127,7 +127,7 @@ async def test_account_deleted_after_lost_result_ack_does_not_block_other_client
             raise httpx.ConnectError("回报收妥后，关联账号被删除且响应丢失")
         return response
 
-    runner = ClientRunner(cfg, control=FastControl(), browser_factory=site.factory, transport=httpx.MockTransport(handler))
+    runner = ClientRunner(cfg, control=FastControl(), forum_factory=site.factory, transport=httpx.MockTransport(handler))
     running = asyncio.create_task(runner.run())
     try:
         await until(lambda: lost[0] and not runner.journal_path.exists() and runner.view["phase"] == "等待任务", [running])
@@ -137,7 +137,8 @@ async def test_account_deleted_after_lost_result_ack_does_not_block_other_client
         assert await running == "stopped"
 
 
-async def test_publish_success_then_client_restart_reconciles_without_duplicate(app, service, config):
+@pytest.mark.parametrize("saved", [True, False])
+async def test_client_restart_reconciles_without_repeating_uncertain_submission(app, service, config, saved):
     a, token_a = service.create_account("a")
     b, token_b = service.create_account("b")
     task_id = service.create_task("恢复测试", forum_url(), 1, 1, [a, b])
@@ -149,18 +150,24 @@ async def test_publish_success_then_client_restart_reconciles_without_duplicate(
     app.extensions["qa_worker"].start()
     cfg_a = client_config(config, "a", token_a)
     # a只负责同步题池；关闭后 b 仍能补答其问题。
-    runner_a = ClientRunner(cfg_a, control=FastControl(), browser_factory=site.factory, transport=flask_transport(app))
+    runner_a = ClientRunner(cfg_a, control=FastControl(), forum_factory=site.factory, transport=flask_transport(app))
     running_a = asyncio.create_task(runner_a.run())
     await until(lambda: bool(service.database.rows("SELECT synced_at FROM members WHERE account_id=?", (a,))[0]["synced_at"]), [running_a])
     runner_a.control.stop.set()
     await running_a
-    site.fail_after_answer = True
+    site.fail_after_answer = saved
+    site.fail_before_answer = not saved
     cfg_b = client_config(config, "b", token_b)
-    first = ClientRunner(cfg_b, control=FastControl(), browser_factory=site.factory, transport=flask_transport(app))
+    first = ClientRunner(cfg_b, control=FastControl(), forum_factory=site.factory, transport=flask_transport(app))
     assert await first.run() == "failed"
-    assert len([p for p in site.published if p[0] == "answer"]) == 1
+    assert len([p for p in site.published if p[0] == "answer"]) == int(saved)
     assert read_json(first.journal_path)["result"]["status"] == "uncertain"
-    second = ClientRunner(cfg_b, control=FastControl(), browser_factory=site.factory, transport=flask_transport(app))
+    second = ClientRunner(cfg_b, control=FastControl(), forum_factory=site.factory, transport=flask_transport(app))
+    if not saved:
+        assert await second.run() == "failed"
+        assert not site.published
+        assert read_json(second.journal_path)["result"]["status"] == "uncertain"
+        return
     resumed = asyncio.create_task(second.run())
     try:
         await until(lambda: service.database.rows("SELECT state FROM tasks")[0]["state"] == "complete", [resumed])
@@ -172,7 +179,7 @@ async def test_publish_success_then_client_restart_reconciles_without_duplicate(
         await resumed
 
 
-async def test_lost_result_ack_repeats_report_not_browser_submission(app, service, config):
+async def test_lost_result_ack_repeats_report_not_session_submission(app, service, config):
     aid, token = service.create_account("a")
     task_id = service.create_task("回报丢失", forum_url(), 1, 1, [aid])
     service.set_task_state(task_id, "running")
@@ -188,7 +195,7 @@ async def test_lost_result_ack_repeats_report_not_browser_submission(app, servic
             raise httpx.ConnectError("模拟服务端已收妥而响应丢失")
         return response
 
-    runner = ClientRunner(client_config(config, "a", token), control=FastControl(), browser_factory=site.factory,
+    runner = ClientRunner(client_config(config, "a", token), control=FastControl(), forum_factory=site.factory,
                           transport=httpx.MockTransport(handler))
     task = asyncio.create_task(runner.run())
     try:
@@ -201,7 +208,7 @@ async def test_lost_result_ack_repeats_report_not_browser_submission(app, servic
         await task
 
 
-async def test_offline_client_preserves_browser_until_stop(app, service, config):
+async def test_offline_client_preserves_session_until_stop(app, service, config):
     aid, token = service.create_account("a")
     requests = [0]
     events = []
@@ -214,7 +221,7 @@ async def test_offline_client_preserves_browser_until_stop(app, service, config)
         return original.handle_request(request)
 
     runner = ClientRunner(client_config(config, "a", token), control=FastControl(), progress=events.append,
-                          browser_factory=Website().factory, transport=httpx.MockTransport(handler))
+                          forum_factory=Website().factory, transport=httpx.MockTransport(handler))
     task = asyncio.create_task(runner.run())
     await until(lambda: any(event["detail"] == "等待连接服务端" for event in events), [task])
     assert not task.done()
@@ -236,7 +243,7 @@ async def test_client_rechecks_external_answer_threshold_before_sending(app, ser
     row["url"] = qa["url"]
     cfg = client_config(config, "b", b[2])
     private_json(cfg.data_directory / "identity.json", {"client_id": "device-b"})
-    runner = ClientRunner(cfg, control=FastControl(), browser_factory=site.factory, transport=flask_transport(app))
+    runner = ClientRunner(cfg, control=FastControl(), forum_factory=site.factory, transport=flask_transport(app))
     running = asyncio.create_task(runner.run())
     try:
         await until(lambda: service.database.rows("SELECT state FROM tasks")[0]["state"] == "complete", [running])
@@ -254,16 +261,24 @@ async def test_captcha_keeps_heartbeats_and_other_client_running(app, service, c
     service.set_task_state(task_id, "running")
     site = Website()
     site.captcha_user = "a"
-    runners = [ClientRunner(client_config(config, name, token), control=FastControl(), browser_factory=site.factory,
+    runners = [ClientRunner(client_config(config, name, token), control=FastControl(), forum_factory=site.factory,
                             transport=flask_transport(app)) for name, (_, token) in zip("ab", accounts)]
     app.extensions["qa_worker"].start()
     running = [asyncio.create_task(r.run()) for r in runners]
     try:
-        await until(lambda: service.database.rows("SELECT client_status FROM accounts WHERE username='a'")[0]["client_status"]
-                    == "等待人工验证" and any(p[0] == "question" and p[1] == "b" for p in site.published), running)
+        await until(lambda: "需要验证码" in service.database.rows(
+            "SELECT client_status FROM accounts WHERE username='a'")[0]["client_status"]
+            and any(p[0] == "question" and p[1] == "b" for p in site.published), running)
         assert service.database.rows("SELECT state FROM operations WHERE account_id=?", (accounts[0][0],))[0]["state"] == "submitting"
+        assert read_json(runners[0].journal_path)["stage"] == "rejected"
+        runners[0].control.stop.set()
+        assert await running[0] == "stopped"
         site.captcha_release.set()
+        runners[0] = ClientRunner(runners[0].config, control=FastControl(), forum_factory=site.factory,
+                                  transport=flask_transport(app))
+        running[0] = asyncio.create_task(runners[0].run())
         await until(lambda: service.database.rows("SELECT state FROM tasks")[0]["state"] == "complete", running)
+        assert len([p for p in site.published if p[0] == "question" and p[1] == "a"]) == 1
     finally:
         for runner in runners:runner.control.stop.set()
         await asyncio.gather(*running)

@@ -3,17 +3,17 @@ import traceback
 from datetime import datetime
 
 from .control import Control
-from .models import Stopped
+from .models import ManualVerification, Stopped
 from .rpc import RemoteClient, RemoteError
 from .storage import ClientLock, private_json, read_json
 
 
 class ClientRunner:
-    def __init__(self, config, *, control=None, progress=None, browser_factory=None, transport=None):
+    def __init__(self, config, *, control=None, progress=None, forum_factory=None, transport=None):
         self.config = config
         self.control = control or Control()
         self.emit = progress or (lambda _: None)
-        self.browser_factory, self.transport = browser_factory, transport
+        self.forum_factory, self.transport = forum_factory, transport
         self.directory = config.data_directory / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         self.journal_path = config.data_directory / "operation.json"
         self.operation = None
@@ -64,55 +64,68 @@ class ClientRunner:
     async def before_send(self):
         if not self.operation or self.operation["kind"] == "inspect":
             raise RuntimeError("没有可发布的服务端操作")
+        if self.operation.get("recover"):
+            while True:
+                current = await self.remote.call("GET", f"work/{self.operation['id']}")
+                if current["state"] != "submitting":
+                    raise RemoteError("操作已失效", "operation_inactive")
+                if current["task"]["state"] == "running":
+                    break
+                self.status("等待管理员恢复任务")
+                await self.control.sleep(3)
+            self.status("")
+        await self.remote.call("POST", f"work/{self.operation['id']}/start")
         journal = read_json(self.journal_path, {})
         journal["stage"] = "submitting"
         private_json(self.journal_path, journal)
-        await self.remote.call("POST", f"work/{self.operation['id']}/start")
         self.log(f"服务端确认发送：{self.operation['id']}")
 
-    async def sync(self, browser, task):
+    async def sync(self, session, task):
         self.update(phase="同步旧题", task_name=task["name"], task_id=task["id"], detail="")
-        forum = await browser.open(task)
+        forum = await session.open(task)
         snapshot = await forum.snapshot(task["question_target"])
         questions = []
         for question in snapshot.questions:
-            state = await forum.inspect_question(question.url)
-            questions.append({"text": state.text, "url": state.url, "answer_count": state.answer_count})
+            count = question.answer_count
+            if count is None:
+                count = (await forum.inspect_question(question.url)).answer_count
+            questions.append({"text": question.text, "url": question.url, "answer_count": count})
         result = await self.remote.call("POST", f"tasks/{task['id']}/sync", {
             "course_name": snapshot.course_name, "question_count": snapshot.count,
             "my_answer_count": snapshot.answer_count, "questions": questions})
         self.task_progress(result["tasks"])
-        await browser.save_login()
         self.log(f"同步任务 {task['id']}：已有提问 {snapshot.count}、回答 {snapshot.answer_count}，登记 {len(questions)} 道")
 
-    async def sync_counts(self, browser, task):
+    async def sync_counts(self, session, task):
         self.update(phase="同步个人统计", task_name=task["name"], task_id=task["id"], detail="")
-        forum = await browser.open(task)
+        forum = await session.open(task)
         snapshot = await forum.snapshot(0)
         result = await self.remote.call("POST", f"tasks/{task['id']}/counts", {
             "question_count": snapshot.count, "my_answer_count": snapshot.answer_count})
         self.task_progress(result["tasks"])
 
-    async def execute(self, browser, operation):
+    async def execute(self, session, operation, *, can_submit):
         task, question = operation["task"], operation["question"]
         self.update(phase={"question": "补充提问", "answer": "补答", "inspect": "核对回答数量"}[operation["kind"]],
                     task_name=task["name"], task_id=task["id"], detail="")
-        forum = await browser.open(task)
+        forum = await session.open(task)
         if operation["kind"] == "inspect":
             actual = await forum.inspect_question(question["url"])
             return {"status": "inspected", "answer_count": actual.answer_count}
         if operation["kind"] == "question":
             if operation.get("recover"):
-                actual = await forum.find_question(operation["body"], task["question_target"])
+                actual = await forum.find_question(operation["body"])
             else:
                 actual = None
-            snapshot = await forum.snapshot(task["question_target"], urls=False)
+            if actual is None and not can_submit:
+                raise RuntimeError("暂未查到该提问，等待核对原提交")
+            snapshot = await forum.snapshot(0)
             if actual is None and snapshot.count >= task["question_target"]:
                 return {"status": "not_needed", "question_count": snapshot.count, "my_answer_count": snapshot.answer_count}
             if actual is None:
-                result = await forum.post_question(operation["body"], lookback=task["question_target"])
+                result = await forum.post_question(operation["body"])
                 actual = result.question
-                snapshot = await forum.snapshot(task["question_target"], urls=False)
+                snapshot = await forum.snapshot(0)
             return {"status": "posted", "text": actual.text, "url": actual.url,
                     "answer_count": actual.answer_count, "question_count": snapshot.count, "my_answer_count": snapshot.answer_count}
         if operation.get("recover"):
@@ -120,21 +133,33 @@ class ClientRunner:
             if actual.is_answered:
                 snapshot = await forum.snapshot(0)
                 return {"status": "already_answered", "answer_count": actual.answer_count, "my_answer_count": snapshot.answer_count}
+            if not can_submit:
+                raise RuntimeError("暂未查到本人回答，等待核对原提交")
         snapshot = await forum.snapshot(0)
         threshold = None if snapshot.answer_count < task.get("account_answer_target", 0) else task["answer_target"]
         result = await forum.answer(question["url"], operation["body"], answer_target=threshold)
         snapshot = await forum.snapshot(0)
         return {"status": result.status, "answer_count": result.question.answer_count, "my_answer_count": snapshot.answer_count}
 
-    async def handle(self, browser, operation, journal=None):
+    async def handle(self, session, operation, journal=None):
         self.operation = operation
+        can_submit = not operation.get("recover") or (
+            journal is not None and journal["stage"] in {"prepared", "rejected"})
         journal = journal or {"operation": operation, "stage": "prepared"}
+        if not can_submit:
+            journal["stage"] = "submitting"
         private_json(self.journal_path, journal)
         try:
             result = journal.get("result")
             if not result or result["status"] == "uncertain":
-                result = await self.execute(browser, operation)
+                result = await self.execute(session, operation, can_submit=can_submit)
         except Stopped:
+            raise
+        except ManualVerification as error:
+            if error.rejected:
+                journal = read_json(self.journal_path)
+                journal["stage"] = "rejected"
+                private_json(self.journal_path, journal)
             raise
         except RemoteError as error:
             if error.code != "operation_inactive":
@@ -142,9 +167,8 @@ class ClientRunner:
             result = {"status": "cancelled"}
         except Exception as error:
             self.log(traceback.format_exc())
-            await browser.failure_snapshot(error)
             stage = read_json(self.journal_path, {}).get("stage")
-            result = {"status": "uncertain" if stage == "submitting" else "failed",
+            result = {"status": "uncertain" if stage in {"submitting", "rejected"} or operation.get("recover") else "failed",
                       "error": self.config.redact(str(error))}
         journal = read_json(self.journal_path)
         journal["result"] = result
@@ -156,16 +180,42 @@ class ClientRunner:
                 raise
             reply = {}
             self.log("关联账号已删除或操作已失效，清理本地操作记录")
-        await browser.save_login()
         self.log(f"操作 {operation['id']}：{result['status']}")
         if reply.get("reconcile"):
-            raise RuntimeError("提交结果尚未确认；请在本客户端重新开始，先核对网页状态")
+            raise RuntimeError("提交结果尚未确认，请在本客户端重新开始核对")
         self.journal_path.unlink(missing_ok=True)
         self.operation = None
         if result["status"] == "failed":
             raise RuntimeError(result["error"])
         if operation["kind"] == "question" and result["status"] in {"posted", "not_needed"}:
-            await self.sync(browser, operation["task"])
+            await self.sync(session, operation["task"])
+
+    async def work(self, session):
+        journal = read_json(self.journal_path)
+        if journal:
+            try:
+                operation = await self.remote.call("GET", f"work/{journal['operation']['id']}")
+            except RemoteError as error:
+                if error.code != "operation_inactive":
+                    raise
+                operation = None
+            if operation and operation["state"] in {"reserved", "submitting"}:
+                await self.handle(session, operation, journal)
+            else:
+                self.journal_path.unlink(missing_ok=True)
+        while True:
+            self.control.check()
+            response = await self.remote.call("POST", "work/claim")
+            if response.get("sync_task"):
+                await self.sync(session, response["sync_task"])
+            elif response.get("sync_counts_task"):
+                await self.sync_counts(session, response["sync_counts_task"])
+            elif response.get("operation"):
+                await self.handle(session, response["operation"])
+            else:
+                self.task_progress(response.get("tasks", []))
+                self.update(phase="等待任务", detail=response.get("wait_reason", ""))
+                await self.control.sleep(3)
 
     async def run(self):
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -179,36 +229,16 @@ class ClientRunner:
                     self.task_progress(connected["tasks"])
                     heartbeat = asyncio.create_task(self.heartbeat())
                     try:
-                        if self.browser_factory is None:
-                            from .browser import BrowserSession
-                            self.browser_factory = BrowserSession
-                        async with self.browser_factory(self.config, self.control, self.log, debug=self.log,
-                                                        output_directory=self.directory, before_send=self.before_send) as browser:
-                            journal = read_json(self.journal_path)
-                            if journal:
-                                try:
-                                    operation = await self.remote.call("GET", f"work/{journal['operation']['id']}")
-                                except RemoteError as error:
-                                    if error.code != "operation_inactive":
-                                        raise
-                                    operation = None
-                                if operation and operation["state"] in {"reserved", "submitting"}:
-                                    await self.handle(browser, operation, journal)
-                                else:
-                                    self.journal_path.unlink(missing_ok=True)
-                            while True:
-                                self.control.check()
-                                response = await self.remote.call("POST", "work/claim")
-                                if response.get("sync_task"):
-                                    await self.sync(browser, response["sync_task"])
-                                elif response.get("sync_counts_task"):
-                                    await self.sync_counts(browser, response["sync_counts_task"])
-                                elif response.get("operation"):
-                                    await self.handle(browser, response["operation"])
-                                else:
-                                    self.task_progress(response.get("tasks", []))
-                                    self.update(phase="等待任务", detail=response.get("wait_reason", ""))
-                                    await self.control.sleep(3)
+                        from .forum import ForumSession
+                        factory = self.forum_factory or ForumSession
+                        async with factory(self.config, self.control, self.log, before_send=self.before_send) as session:
+                            try:
+                                await self.work(session)
+                            except ManualVerification as error:
+                                self.log(error)
+                                self.update(phase="等待人工验证", detail=f"{error}。请在论坛处理，完成后停止并重新开始")
+                                while True:
+                                    await self.control.sleep(1)
                     finally:
                         self.closing = True
                         heartbeat.cancel()

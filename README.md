@@ -6,7 +6,7 @@ Python 3.13、uv。服务端与单账号客户端已拆成两个独立安装包�
 | 目录 | 安装包 / 启动命令 | 职责 |
 | --- | --- | --- |
 | [server/](server/README.md) | `qa-util-server` / `qa_util_server` | Flask 管理任务、配额、LLM 生成和操作分配 |
-| [client/](client/README.md) | `qa-util-client` / `qa_util` | Tkinter 界面、单账号 Playwright 登录和网页操作 |
+| [client/](client/README.md) | `qa-util-client` / `qa_util` | Tkinter 界面、单账号 HTTP 登录和论坛操作 |
 
 服务端无需浏览器或 Tkinter；客户端无需 Flask、dotenv 或 LLM 设置。两端通过 HTTP 通信，没有 Python 包互相依赖。
 
@@ -30,7 +30,6 @@ uv run --directory server --no-dev qa_util_server
 
 ```sh
 uv sync --project client --locked --no-dev --managed-python
-uv run --directory client --no-dev playwright install chromium
 cp -n client/client.example.json client/client.json
 uv run --directory client --no-dev qa_util --config client.json
 ```
@@ -48,7 +47,8 @@ Python 需提供 Tkinter；各实例使用独立数据目录。
 没有入口只跳过该账号与该题的组合，不虚增回答数；没有合适账号时继续等待。
 
 服务端自动生成和下发内容，无生成预览确认。发送默认间隔 10 秒，可在服务端 `.env` 调整。
-验证码等待用户人工处理，心跳继续；断网暂停新发送，恢复或重启先核对网页，再回报结果。
+论坛查询和发布使用 curl_cffi。遇到验证码或风控时暂停提交并维持心跳，在论坛人工处理后停止并重新开始。
+断网暂停新发送，恢复或重启后先通过论坛接口核对，再回报结果。
 管理页暂停任务后不再分配新操作，提交中的操作完成核对。客户端完成后保持在线等待新任务。
 
 ## 配置与迁移

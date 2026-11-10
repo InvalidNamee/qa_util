@@ -1,24 +1,21 @@
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 root = Path(SPECPATH)
 
 a = Analysis(
     [str(root / "packaging" / "launcher.py")],
     pathex=[str(root / "src")],
-    binaries=[],
-    datas=[],
-    hiddenimports=["qa_util.browser"],
+    binaries=collect_dynamic_libs("curl_cffi"),
+    datas=collect_data_files("curl_cffi"),
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=["pytest", "PyInstaller"],
     noarchive=False,
 )
-# 浏览器由 build.py 在最后原样复制，避免打包器改写其签名和 Framework 结构。
-browser_prefix = "playwright/driver/package/.local-browsers/"
-a.datas = [entry for entry in a.datas if not entry[0].replace("\\", "/").startswith(browser_prefix)]
-a.binaries = [entry for entry in a.binaries if not entry[0].replace("\\", "/").startswith(browser_prefix)]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,

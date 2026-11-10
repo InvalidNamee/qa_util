@@ -38,7 +38,7 @@ class Control:
         self.check()
 
     async def interruptible(self, awaitable: Awaitable[T]) -> T:
-        """用于 HTTP/确认等可取消操作；不要用于 Playwright 调用。"""
+        """让停止按钮能取消仍在等待的 HTTP 请求。"""
         task = asyncio.ensure_future(awaitable)
         try:
             while not task.done():

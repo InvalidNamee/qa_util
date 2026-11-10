@@ -13,7 +13,7 @@ async def test_existing_clients_continue_after_completed_task_is_edited(app, ser
     service.set_task_state(task, "running")
     site = Website()
     runners = [ClientRunner(client_config(config, name, token), control=FastControl(),
-                            browser_factory=site.factory, transport=flask_transport(app))
+                            forum_factory=site.factory, transport=flask_transport(app))
                for name, (_, token) in zip("ab", accounts)]
     app.extensions["qa_worker"].start()
     running = [asyncio.create_task(runner.run()) for runner in runners]
