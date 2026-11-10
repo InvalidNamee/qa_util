@@ -16,6 +16,8 @@ small,.muted{color:#68717c}.error{color:#a32929;white-space:pre-wrap}
 .management-dialog{width:min(400px,calc(100% - 64px));border:1px solid #ddd;border-radius:7px;padding:24px}
 .management-dialog::backdrop{background:#0005}.management-dialog input:not([type=hidden]){box-sizing:border-box;width:100%}
 .management-dialog .actions{justify-content:flex-end}
+.task-dialog{width:min(720px,calc(100% - 64px))}.task-dialog input[type=checkbox]{width:auto}
+.task-dialog input[type=number]{width:85px}.task-dialog label:has(input[type=url]){display:block}
 #token-value{font-family:monospace}
 </style>
 <header><h1>qa_util · 管理</h1>{% if session.admin %}<form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf" value="{{ csrf() }}"><button>退出</button></form>{% endif %}</header>

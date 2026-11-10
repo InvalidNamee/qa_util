@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS questions (
  observed_at REAL NOT NULL DEFAULT 0,
  UNIQUE(task_id, owner_id, position), UNIQUE(task_id, url)
 );
+CREATE VIEW IF NOT EXISTS active_questions AS
+ SELECT q.* FROM questions q JOIN tasks t ON t.id=q.task_id
+ JOIN members m ON m.task_id=q.task_id AND m.account_id=q.owner_id
+ WHERE q.position<t.question_target;
 CREATE TABLE IF NOT EXISTS answer_drafts (
  id INTEGER PRIMARY KEY, question_id INTEGER NOT NULL REFERENCES questions(id),
  text TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'ready'

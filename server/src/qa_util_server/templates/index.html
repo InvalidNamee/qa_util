@@ -34,14 +34,27 @@
 <p><label>论坛链接 <input type="url" name="forum_url" required></label></p>
 <p><label>每号提问目标 <input type="number" name="question_target" min="1" value="20" required oninput="document.getElementById('account-answer-target').max=this.value"></label><label>每号回答目标 <input id="account-answer-target" type="number" name="account_answer_target" min="1" max="20" value="20" required></label><label>每题回答阈值 <input type="number" name="answer_target" min="1" value="5" required></label></p>
 <p>参与账号：{% for a in accounts %}<label><input type="checkbox" name="accounts" value="{{ a.id }}">{{ account_label(a) }}</label>{% endfor %}</p><button>创建任务</button></form></details>
-<p class="muted">刷新页面更新进度。每号回答目标不大于提问目标，已有“我的回答”抵扣个人目标；个人两项目标与每题阈值全部达标才完成。个人达标后仍补题目阈值。运行参数固定，调整目标请新建任务。</p>
+<p class="muted">刷新页面更新进度。每号回答目标不大于提问目标，已有“我的回答”抵扣个人目标；个人两项目标与每题阈值全部达标才完成。个人达标后仍补题目阈值。暂停任务后可编辑，保存后手动恢复。</p>
 {% for t in tasks %}<section><h2>{{ t.name }} · {{ {'draft':'未启动','running':'运行中','paused':'已暂停','complete':'已完成'}[t.state] }}</h2>
 <p><a href="{{ t.forum_url }}" target="_blank" rel="noreferrer">打开论坛</a> · 每号提问 {{ t.question_target }} 道 · 每号回答 {{ t.account_answer_target if t.account_answer_target else '未设置（旧任务）' }} 条 · 每题至少 {{ t.answer_target }} 条回答</p>
 <div class="actions">{% if t.state != 'complete' and t.members %}<form method="post" action="{{ url_for('task_action',task_id=t.id,action='pause' if t.state=='running' else 'start') }}"><input type="hidden" name="csrf" value="{{ csrf() }}"><button>{{ '暂停' if t.state=='running' else '启动 / 恢复' }}</button></form>{% endif %}
+{% if t.state != 'running' %}<button type="button" onclick="document.getElementById('task-edit-{{ t.id }}').showModal()"{% if t.pending_reconciliation %} disabled title="请先等待提交或核对完成"{% endif %}>编辑任务</button>{% endif %}
 {% if t.error %}<form method="post" action="{{ url_for('task_action',task_id=t.id,action='retry') }}"><input type="hidden" name="csrf" value="{{ csrf() }}"><button>重试失败操作</button></form>{% endif %}</div>
+{% if t.state != 'running' %}
+<dialog id="task-edit-{{ t.id }}" class="management-dialog task-dialog" aria-labelledby="task-edit-heading-{{ t.id }}"><form method="post" action="{{ url_for('edit_task',task_id=t.id) }}">
+<input type="hidden" name="csrf" value="{{ csrf() }}"><h2 id="task-edit-heading-{{ t.id }}">编辑任务</h2>
+<p><label>名称 <input name="name" value="{{ t.name }}" required></label></p>
+<p><label>论坛链接 <input type="url" name="forum_url" value="{{ t.forum_url }}" required></label></p>
+<p><label>每号提问目标 <input type="number" name="question_target" min="1" value="{{ t.question_target }}" required oninput="document.getElementById('edit-account-answer-{{ t.id }}').max=this.value"></label><label>每号回答目标 <input id="edit-account-answer-{{ t.id }}" type="number" name="account_answer_target" min="{{ 0 if t.account_answer_target == 0 else 1 }}" max="{{ t.question_target }}" value="{{ t.account_answer_target }}" required></label><label>每题回答阈值 <input type="number" name="answer_target" min="1" value="{{ t.answer_target }}" required></label></p>
+{% if t.account_answer_target == 0 %}<p class="muted">旧任务每号回答目标为 0 时保留原规则。</p>{% endif %}
+<p>参与账号：{% for a in accounts %}<label><input type="checkbox" name="accounts" value="{{ a.id }}"{% if a.id in t.members|map(attribute='account_id')|list %} checked{% endif %}>{{ account_label(a) }}</label>{% endfor %}</p>
+<p class="muted">同一论坛保留已有进度，缩小目标或移除账号后，相应题目暂不参与。更换论坛会清空本任务的本地题池和统计，恢复后重新同步；网页内容保留。</p>
+<div class="actions"><button type="button" onclick="document.getElementById('task-edit-{{ t.id }}').close()">取消</button><button>保存</button></div>
+</form></dialog>
+{% endif %}
 {% if t.error %}<p class="error">{{ t.error }}</p>{% endif %}
 {% if t.pending_reconciliation %}<p class="muted">有 {{ t.pending_reconciliation|length }} 个正在提交或等待原客户端核对的操作。</p>{% endif %}
-{% if not t.members %}<p class="muted">任务已无参与账号，请新建任务。</p>{% endif %}
+{% if not t.members %}<p class="muted">任务已无参与账号，请编辑任务选择账号。</p>{% endif %}
 <table><tr><th>账号</th><th>累计提问 / 目标</th><th>累计回答 / 目标</th></tr>{% for m in t.members %}<tr><td>{{ account_label(m) }}</td><td>{{ m.question_count if m.synced_at is not none else '尚未同步' }} / {{ t.question_target }}</td><td>{{ m.answer_count if m.answer_count is not none else '尚未同步' }} / {{ t.account_answer_target if t.account_answer_target else '未设置' }}</td></tr>{% endfor %}</table>
 <details open><summary>题池与回答进度（{{ t.questions|length }} 道）</summary><table><tr><th>作者</th><th>题目</th><th>网页回答 / 阈值</th></tr>{% for q in t.questions %}<tr><td>{{ account_label(q) }}</td><td>{% if q.url %}<a href="{{ q.url }}" target="_blank" rel="noreferrer">{{ q.text }}</a>{% else %}{{ q.text or '等待生成' }} <small>尚未发布</small>{% endif %}</td><td>{{ q.answer_count }} / {{ t.answer_target }}{% if q.url and q.answer_count < t.answer_target %}<br><small>待补答；无合适账号时继续等待</small>{% endif %}</td></tr>{% endfor %}</table></details>
 </section>{% else %}<section>还没有论坛任务。</section>{% endfor %}

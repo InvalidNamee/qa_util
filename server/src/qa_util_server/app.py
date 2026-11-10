@@ -145,6 +145,14 @@ def create_app(settings=None, *, generator=None, start_worker=True):
             abort(404)
         return redirect(url_for("index"))
 
+    @app.post("/tasks/<int:task_id>/edit")
+    def edit_task(task_id):
+        service.update_task(task_id, request.form.get("name", ""), request.form.get("forum_url", ""),
+                            int(request.form.get("question_target", "0")), int(request.form.get("answer_target", "0")),
+                            [int(value) for value in request.form.getlist("accounts")],
+                            account_answer_target=int(request.form.get("account_answer_target", "0")))
+        return redirect(url_for("index"))
+
     @app.post("/api/v1/session")
     def api_session():
         body = payload()

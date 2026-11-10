@@ -6,7 +6,7 @@ import uuid
 
 from .config import http_url
 from .models import normalize
-from .urls import question_url
+from .urls import canonical_url, question_url
 
 
 class ApiError(Exception):
@@ -97,26 +97,73 @@ class Service:
                        (self.token_hash(token), account_id))
         return token
 
-    def create_task(self, name, forum_url, question_target, answer_target, accounts, *, account_answer_target=None):
+    @staticmethod
+    def _task_parameters(name, forum_url, question_target, answer_target, accounts, account_answer_target, *, minimum=1):
         name, forum_url = text(name), http_url(forum_url)
         integer(question_target, 1)
         integer(answer_target, 1)
         if account_answer_target is None:
             account_answer_target = question_target
-        integer(account_answer_target, 1)
+        integer(account_answer_target, minimum)
         if account_answer_target > question_target:
             raise ValueError("每号回答目标不能大于每号提问目标")
         accounts = sorted(set(accounts))
         if not accounts:
             raise ValueError("请选择参与账号")
+        return (name, forum_url, question_target, answer_target, account_answer_target), accounts
+
+    def create_task(self, name, forum_url, question_target, answer_target, accounts, *, account_answer_target=None):
+        parameters, accounts = self._task_parameters(name, forum_url, question_target, answer_target, accounts, account_answer_target)
         with self.database.transaction() as db:
             if any(not db.execute("SELECT 1 FROM accounts WHERE id=?", (aid,)).fetchone() for aid in accounts):
                 raise ValueError("参与账号不存在")
             task_id = db.execute("""INSERT INTO tasks(name,forum_url,question_target,answer_target,account_answer_target,created_at)
                                   VALUES (?,?,?,?,?,?)""",
-                                 (name, forum_url, question_target, answer_target, account_answer_target, self.clock())).lastrowid
+                                 (*parameters, self.clock())).lastrowid
             db.executemany("INSERT INTO members(task_id,account_id) VALUES (?,?)", [(task_id, aid) for aid in accounts])
         return task_id
+
+    def update_task(self, task_id, name, forum_url, question_target, answer_target, accounts, *, account_answer_target=None):
+        with self.database.transaction() as db:
+            task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not task:
+                raise ApiError("任务不存在", 404)
+            if task["state"] == "running":
+                raise ValueError("请先暂停任务再编辑")
+            if db.execute("SELECT 1 FROM operations WHERE task_id=? AND state='submitting'", (task_id,)).fetchone():
+                raise ValueError("还有正在提交或等待核对的操作，请完成核对后再编辑")
+            parameters, accounts = self._task_parameters(
+                name, forum_url, question_target, answer_target, accounts, account_answer_target,
+                minimum=0 if task["account_answer_target"] == 0 else 1)
+            if any(not db.execute("SELECT 1 FROM accounts WHERE id=?", (aid,)).fetchone() for aid in accounts):
+                raise ValueError("参与账号不存在")
+            db.execute("""UPDATE answer_drafts SET state='ready' WHERE id IN
+                          (SELECT draft_id FROM operations WHERE task_id=? AND state='reserved')""", (task_id,))
+            db.execute("UPDATE operations SET state='cancelled' WHERE task_id=? AND state IN ('reserved','failed')", (task_id,))
+            db.execute("""DELETE FROM answer_attempts WHERE status='failed' AND question_id IN
+                          (SELECT id FROM questions WHERE task_id=?)""", (task_id,))
+            # 取消而不复用生成任务编号，正在等待 API 的旧请求不能写回修改后的任务。
+            db.execute("""UPDATE generation_jobs SET state='cancelled',error=''
+                          WHERE task_id=? AND state IN ('pending','running','failed')""", (task_id,))
+            changed_forum = canonical_url(parameters[1]) != canonical_url(task["forum_url"])
+            if changed_forum:
+                db.execute("UPDATE generation_jobs SET state='cancelled',owner_id=NULL,question_id=NULL WHERE task_id=?", (task_id,))
+                db.execute("DELETE FROM operations WHERE task_id=?", (task_id,))
+                db.execute("DELETE FROM answer_attempts WHERE question_id IN (SELECT id FROM questions WHERE task_id=?)", (task_id,))
+                db.execute("DELETE FROM answer_drafts WHERE question_id IN (SELECT id FROM questions WHERE task_id=?)", (task_id,))
+                db.execute("DELETE FROM questions WHERE task_id=?", (task_id,))
+                db.execute("""UPDATE members SET question_count=0,synced_at=NULL,answer_count=NULL,answer_synced_at=NULL
+                              WHERE task_id=?""", (task_id,))
+            elif question_target != task["question_target"]:
+                db.execute("UPDATE members SET synced_at=NULL WHERE task_id=?", (task_id,))
+            for member in db.execute("SELECT account_id FROM members WHERE task_id=?", (task_id,)).fetchall():
+                if member[0] not in accounts:
+                    db.execute("DELETE FROM members WHERE task_id=? AND account_id=?", (task_id, member[0]))
+            db.executemany("INSERT OR IGNORE INTO members(task_id,account_id) VALUES (?,?)", [(task_id, aid) for aid in accounts])
+            db.execute("""UPDATE tasks SET name=?,forum_url=?,question_target=?,answer_target=?,account_answer_target=?,
+                          state=?,course_name=?,error='' WHERE id=?""",
+                       (*parameters, 'draft' if task["state"] == 'draft' else 'paused',
+                        '' if changed_forum else task["course_name"], task_id))
 
     def set_task_state(self, task_id, state):
         if state not in {"running", "paused"}:
@@ -126,9 +173,9 @@ class Service:
             if not task:
                 raise ApiError("任务不存在", 404)
             if task["state"] == "complete":
-                raise ValueError("任务已经完成；修改目标请新建任务")
+                raise ValueError("任务已经完成，请先编辑任务再启动")
             if state == "running" and not db.execute("SELECT 1 FROM members WHERE task_id=?", (task_id,)).fetchone():
-                raise ValueError("任务已无参与账号，请新建任务")
+                raise ValueError("任务已无参与账号，请编辑任务选择账号")
             db.execute("UPDATE tasks SET state=? WHERE id=?", (state, task_id))
             if state == "running":
                 self.schedule(db, task_id)
@@ -187,13 +234,13 @@ class Service:
         for row in rows:
             task = dict(row)
             task["publish_interval_seconds"] = self.interval
-            task["questions_registered"] = db.execute("SELECT count(*) FROM questions WHERE task_id=? AND url IS NOT NULL",
+            task["questions_registered"] = db.execute("SELECT count(*) FROM active_questions WHERE task_id=? AND url IS NOT NULL",
                                                        (task["id"],)).fetchone()[0]
-            task["questions_satisfied"] = db.execute("SELECT count(*) FROM questions WHERE task_id=? AND url IS NOT NULL AND answer_count>=?",
+            task["questions_satisfied"] = db.execute("SELECT count(*) FROM active_questions WHERE task_id=? AND url IS NOT NULL AND answer_count>=?",
                                                       (task["id"], task["answer_target"])).fetchone()[0]
             task["questions_expected"] = task["question_target"] * db.execute(
                 "SELECT count(*) FROM members WHERE task_id=?", (task["id"],)).fetchone()[0]
-            task["answers_done"] = db.execute("""SELECT count(*) FROM answer_attempts a JOIN questions q ON q.id=a.question_id
+            task["answers_done"] = db.execute("""SELECT count(*) FROM answer_attempts a JOIN active_questions q ON q.id=a.question_id
                                                 WHERE q.task_id=? AND a.account_id=? AND a.status IN ('posted','already_answered')""",
                                                (task["id"], account_id)).fetchone()[0]
             result.append(task)
@@ -214,6 +261,8 @@ class Service:
         with self.database.transaction() as db:
             self._session(db, account_id, session_id)
             task = self._member(db, task_id, account_id)
+            if task["state"] != "running":
+                return {"tasks": self._tasks(db, account_id)}
             if len(questions) != min(count, task["question_target"]):
                 raise ValueError("个人题目数量与统计不符")
             if task["course_name"] and task["course_name"] != course:
@@ -234,7 +283,7 @@ class Service:
                 if row and row["owner_id"] != account_id:
                     raise ValueError("题目已属于另一个账号")
                 if not row:
-                    row = db.execute("""SELECT q.* FROM questions q WHERE task_id=? AND owner_id=? AND url IS NULL
+                    row = db.execute("""SELECT q.* FROM active_questions q WHERE task_id=? AND owner_id=? AND url IS NULL
                                         AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.question_id=q.id
                                                         AND o.state IN ('reserved','submitting'))
                                         ORDER BY CASE WHEN text=? THEN 0 ELSE 1 END,position LIMIT 1""",
@@ -261,6 +310,8 @@ class Service:
         with self.database.transaction() as db:
             self._session(db, account_id, session_id)
             task = self._member(db, task_id, account_id)
+            if task["state"] != "running":
+                return {"tasks": self._tasks(db, account_id)}
             db.execute("UPDATE members SET question_count=? WHERE task_id=? AND account_id=?",
                        (count, task_id, account_id))
             self._answer_count(db, task, account_id, payload)
@@ -272,14 +323,14 @@ class Service:
         task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not task or task["state"] != "running" or not task["course_name"]:
             return
-        owners = db.execute("""SELECT DISTINCT q.owner_id FROM questions q JOIN members m
+        owners = db.execute("""SELECT DISTINCT q.owner_id FROM active_questions q JOIN members m
                                ON m.task_id=q.task_id AND m.account_id=q.owner_id WHERE q.task_id=?
-                               AND q.url IS NULL AND q.text='' AND m.question_count<?""",
+                               AND q.url IS NULL AND q.text='' AND m.synced_at IS NOT NULL AND m.question_count<?""",
                             (task_id, task["question_target"])).fetchall()
         for owner in owners:
             db.execute("""INSERT OR IGNORE INTO generation_jobs(task_id,kind,owner_id,created_at)
                           VALUES (?,'questions',?,?)""", (task_id, owner[0], self.clock()))
-        for question in db.execute("SELECT * FROM questions WHERE task_id=? AND url IS NOT NULL", (task_id,)).fetchall():
+        for question in db.execute("SELECT * FROM active_questions WHERE task_id=? AND url IS NOT NULL", (task_id,)).fetchall():
             available = db.execute("SELECT count(*) FROM answer_drafts WHERE question_id=? AND state IN ('ready','reserved')",
                                    (question["id"],)).fetchone()[0]
             if available < self.answer_need(db, question):
@@ -347,7 +398,7 @@ class Service:
                                   ORDER BY CASE WHEN t.id>? THEN 0 ELSE 1 END,t.id""",
                                (account_id, account["task_cursor"])).fetchall()
             for task in tasks:
-                registered = db.execute("SELECT count(*) FROM questions WHERE task_id=? AND owner_id=? AND url IS NOT NULL",
+                registered = db.execute("SELECT count(*) FROM active_questions WHERE task_id=? AND owner_id=? AND url IS NOT NULL",
                                         (task["id"], account_id)).fetchone()[0]
                 if task["synced_at"] is None or registered < min(task["question_count"], task["question_target"]):
                     return {"sync_task": dict(task)}
@@ -357,14 +408,14 @@ class Service:
                     return {"sync_counts_task": dict(task)}
                 self._complete(db, task["id"])
                 self.schedule(db, task["id"])
-                own = db.execute("""SELECT q.* FROM questions q WHERE task_id=? AND owner_id=? AND url IS NULL AND text<>''
+                own = db.execute("""SELECT q.* FROM active_questions q WHERE task_id=? AND owner_id=? AND url IS NULL AND text<>''
                                      AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.question_id=q.id
                                        AND o.state IN ('reserved','submitting','failed')) ORDER BY position LIMIT 1""",
                                  (task["id"], account_id)).fetchone()
                 if own:
                     return self._reserve(db, account_id, session_id, task, own, "question")
                 personal = (task["my_answer_count"] or 0) < task["account_answer_target"]
-                questions = db.execute("""SELECT q.* FROM questions q WHERE task_id=? AND url IS NOT NULL AND (answer_count<? OR ?)
+                questions = db.execute("""SELECT q.* FROM active_questions q WHERE task_id=? AND url IS NOT NULL AND (answer_count<? OR ?)
                                           AND NOT EXISTS (SELECT 1 FROM operations o JOIN questions other ON other.id=o.question_id
                                                           WHERE o.state IN ('reserved','submitting')
                                                             AND (o.question_id=q.id OR other.url=q.url))
@@ -399,8 +450,10 @@ class Service:
                 raise ApiError("操作已删除，请重新领取", 404, "operation_inactive")
             if operation["state"] == "submitting":
                 return {"allowed": True}
+            if operation["state"] != "reserved" or operation["reserved_until"] < self.clock():
+                raise ApiError("操作已过期或任务已暂停，请重新领取", 409, "operation_inactive")
             task = self._member(db, operation["task_id"], account_id)
-            if operation["state"] != "reserved" or operation["reserved_until"] < self.clock() or task["state"] != "running":
+            if task["state"] != "running":
                 raise ApiError("操作已过期或任务已暂停，请重新领取", 409, "operation_inactive")
             db.execute("UPDATE operations SET state='submitting' WHERE id=?", (operation_id,))
             return {"allowed": True}
@@ -479,7 +532,7 @@ class Service:
         if task["state"] != "running":
             return
         members = db.execute("SELECT * FROM members WHERE task_id=?", (task_id,)).fetchall()
-        registered, satisfied = db.execute("""SELECT count(*),coalesce(sum(answer_count>=?),0) FROM questions
+        registered, satisfied = db.execute("""SELECT count(*),coalesce(sum(answer_count>=?),0) FROM active_questions
                                              WHERE task_id=? AND url IS NOT NULL""", (task["answer_target"], task_id)).fetchone()
         busy = db.execute("SELECT 1 FROM operations WHERE task_id=? AND state IN ('reserved','submitting')", (task_id,)).fetchone()
         if members and all(m["synced_at"] is not None and m["question_count"] >= task["question_target"]
@@ -493,9 +546,9 @@ class Service:
         accounts = self.database.rows("SELECT id,username,alias,last_seen,session_until,client_status FROM accounts ORDER BY id")
         tasks = self.database.rows("SELECT * FROM tasks ORDER BY id DESC")
         for task in tasks:
-            task["members"] = self.database.rows("""SELECT a.username,a.alias,m.question_count,m.synced_at,m.answer_count FROM members m
+            task["members"] = self.database.rows("""SELECT m.account_id,a.username,a.alias,m.question_count,m.synced_at,m.answer_count FROM members m
                                                     JOIN accounts a ON a.id=m.account_id WHERE m.task_id=? ORDER BY a.id""", (task["id"],))
-            task["questions"] = self.database.rows("""SELECT q.*,a.username,a.alias FROM questions q JOIN accounts a ON a.id=q.owner_id
+            task["questions"] = self.database.rows("""SELECT q.*,a.username,a.alias FROM active_questions q JOIN accounts a ON a.id=q.owner_id
                                                        WHERE q.task_id=? ORDER BY owner_id,position""", (task["id"],))
             task["pending_reconciliation"] = self.database.rows(
                 "SELECT id,error FROM operations WHERE task_id=? AND state='submitting'", (task["id"],))

@@ -33,7 +33,7 @@ class GenerationWorker:
             job = dict(job)
             db.execute("UPDATE generation_jobs SET state='running' WHERE id=?", (job["id"],))
             if job["kind"] == "questions":
-                selected = db.execute("""SELECT id FROM questions WHERE task_id=? AND owner_id=? AND url IS NULL
+                selected = db.execute("""SELECT id FROM active_questions WHERE task_id=? AND owner_id=? AND url IS NULL
                                          AND text='' ORDER BY position LIMIT 10""", (job["task_id"], job["owner_id"])).fetchall()
                 count = len(selected)
                 existing = [row[0] for row in db.execute("SELECT text FROM questions WHERE task_id=? AND text<>''", (job["task_id"],))]
